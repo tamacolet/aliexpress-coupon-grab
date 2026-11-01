@@ -77,11 +77,17 @@ class CouponResultGateTest {
         assertEquals(CouponResultGate.Action.INVALID, changed.observe(observation(CouponUiState.INVALID), 102))
     }
 
-    @Test fun `applied and confirmation need no grace period`() {
-        listOf(CouponUiState.APPLIED to CouponResultGate.Action.APPLIED,
-            CouponUiState.CONFIRMATION to CouponResultGate.Action.APPROVE).forEach { (state, action) ->
-            assertEquals(action, CouponResultGate(stale, 100).observe(observation(state), 100))
-        }
+    @Test fun `confirmation needs no grace period but applied must hold for 1500ms`() {
+        assertEquals(CouponResultGate.Action.APPROVE,
+            CouponResultGate(stale, 100).observe(observation(CouponUiState.CONFIRMATION), 100))
+        val gate = CouponResultGate(stale, 100)
+        assertEquals(CouponResultGate.Action.WAIT, gate.observe(observation(CouponUiState.APPLIED), 100))
+        assertEquals(CouponResultGate.Action.WAIT, gate.observe(observation(CouponUiState.APPLIED), 1_599))
+        assertEquals(CouponResultGate.Action.APPLIED, gate.observe(observation(CouponUiState.APPLIED), 1_600))
+        val interrupted = CouponResultGate(stale, 100)
+        interrupted.observe(observation(CouponUiState.APPLIED), 100)
+        assertEquals(CouponResultGate.Action.APPROVE, interrupted.observe(observation(CouponUiState.CONFIRMATION), 900))
+        assertEquals(CouponResultGate.Action.WAIT, interrupted.observe(observation(CouponUiState.APPLIED), 1_700))
     }
 
     @Test fun `runtime flow sees stale invalid then approves confirmation and awaits applied`() = runBlocking {
@@ -90,22 +96,23 @@ class CouponResultGateTest {
             CouponUiState.CONFIRMATION, CouponUiState.DIALOG, CouponUiState.UNKNOWN, CouponUiState.APPLIED))
         var now = 0L
         val outcome = AutomationFlow.awaitOutcome(CouponResultGate(stale, 0),
-            read = { observation(states.removeFirst()).also { actions += it.state.name } },
+            read = { observation(if (states.size > 1) states.removeFirst() else states.first()).also { actions += it.state.name } },
             nowMs = { now }, approve = { actions += "approve" }, pause = { now += 500 })
         assertEquals(CouponUiState.APPLIED, outcome)
-        assertEquals(listOf("INVALID", "CONFIRMATION", "approve", "CONFIRMATION", "DIALOG", "UNKNOWN", "APPLIED"), actions)
+        assertEquals(listOf("INVALID", "CONFIRMATION", "approve", "CONFIRMATION", "DIALOG", "UNKNOWN", "APPLIED", "APPLIED", "APPLIED", "APPLIED"), actions)
     }
 
     @Test fun `runtime before next flow blocks all next code preparation until confirmation applied`() = runBlocking {
         val actions = mutableListOf<String>()
         val states = ArrayDeque(listOf(CouponUiState.CONFIRMATION, CouponUiState.DIALOG,
             CouponUiState.UNKNOWN, CouponUiState.APPLIED))
+        var now = 5_000L
         val state = AutomationFlow.settleBeforeNext(
-            read = { observation(states.removeFirst()).also { actions += it.state.name } },
-            nowMs = { 5_000 }, approve = { actions += "approve" }, pause = { actions += "wait" })
+            read = { observation(if (states.size > 1) states.removeFirst() else states.first()).also { actions += it.state.name } },
+            nowMs = { now }, approve = { actions += "approve" }, pause = { actions += "wait"; now += 1_500 })
         actions += "prepare-next"
         assertEquals(CouponUiState.APPLIED, state)
-        assertEquals(listOf("CONFIRMATION", "approve", "wait", "DIALOG", "wait", "UNKNOWN", "wait", "APPLIED", "prepare-next"), actions)
+        assertEquals(listOf("CONFIRMATION", "approve", "wait", "DIALOG", "wait", "UNKNOWN", "wait", "APPLIED", "wait", "APPLIED", "prepare-next"), actions)
     }
 
     @Test fun `execution recovery approves previous code and rotates the preparing code`() = runBlocking {
@@ -115,16 +122,17 @@ class CouponResultGateTest {
         val actions = mutableListOf<String>()
         val states = ArrayDeque(listOf(CouponUiState.CONFIRMATION, CouponUiState.UNKNOWN, CouponUiState.APPLIED))
         AutomationFlow.resolveConfirmation(cleaningUp = false, settle = {
+            var now = 0L
             val state = AutomationFlow.settleBeforeNext(
-                read = { observation(states.removeFirst()).also { actions += it.state.name } },
-                nowMs = { 0 }, approve = { actions += "approve" }, pause = { actions += "wait" })
+                read = { observation(if (states.size > 1) states.removeFirst() else states.first()).also { actions += it.state.name } },
+                nowMs = { now }, approve = { actions += "approve" }, pause = { actions += "wait"; now += 1_500 })
             assertEquals(CouponUiState.APPLIED, state)
             if (rotation.finishIfPending("A", CodeStatus.APPLIED)) results += "A" to CodeStatus.APPLIED
         }, cancel = { fail("execution must never cancel") })
         actions += "close"
         if (rotation.afterRecovery("B", previousCompleted = true)) results += "B" to CodeStatus.FAILURE
         if (rotation.finishIfPending("A", CodeStatus.FAILURE)) fail("success must be retained")
-        assertEquals(listOf("CONFIRMATION", "approve", "wait", "UNKNOWN", "wait", "APPLIED", "close"), actions)
+        assertEquals(listOf("CONFIRMATION", "approve", "wait", "UNKNOWN", "wait", "APPLIED", "wait", "APPLIED", "close"), actions)
         assertEquals(listOf("A" to CodeStatus.APPLIED), results)
         assertEquals(listOf("B"), rotation.pending())
         AutomationFlow.resolveConfirmation(cleaningUp = true,

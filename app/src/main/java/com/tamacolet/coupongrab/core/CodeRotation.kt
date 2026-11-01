@@ -69,16 +69,26 @@ data class CouponObservation(val state: CouponUiState, val validation: Validatio
     }
 }
 
-/** 承認は4秒ずつ最大2回。古い検証表示は、新しい結果になるまで待つ。 */
+/**
+ * 承認は4秒ずつ最大2回。古い検証表示は、新しい結果になるまで待つ。
+ * 高い券が当たった後に低い券を入れると、小窓が閉じてプロモコード行が新しいコードになり、
+ * 前の券の「割引額」が残ったまま確認窓が遅れて出る。そのすき間を「取れた」と読まないよう、
+ * 取れた表示が APPLIED_STABLE_MS 続いた時だけ確定する（NAS のスマホ確認も1.5秒後に読み直す）。
+ */
 class CouponResultGate(private val before: ValidationSnapshot, private val pressedAtMs: Long) {
     enum class Action { WAIT, APPROVE, APPLIED, USED, INVALID, FAIL }
     private var approvedAtMs: Long? = null
     private var approvals = 0
     private var validationChanged = false
+    private var appliedSinceMs: Long? = null
 
     fun observe(observation: CouponObservation, nowMs: Long): Action {
         if (observation.validation != before) validationChanged = true
-        if (observation.state == CouponUiState.APPLIED) return Action.APPLIED
+        if (observation.state == CouponUiState.APPLIED) {
+            val since = appliedSinceMs ?: nowMs.also { appliedSinceMs = it }
+            return if (nowMs - since >= APPLIED_STABLE_MS) Action.APPLIED else Action.WAIT
+        }
+        appliedSinceMs = null
         if (observation.state == CouponUiState.CONFIRMATION) {
             val approvedAt = approvedAtMs
             if (approvedAt != null && nowMs - approvedAt < 4_000) return Action.WAIT
@@ -92,6 +102,10 @@ class CouponResultGate(private val before: ValidationSnapshot, private val press
             CouponUiState.INVALID -> if (approvedAtMs != null || validationChanged || nowMs - pressedAtMs >= 1_200) Action.INVALID else Action.WAIT
             else -> if (approvedAtMs?.let { nowMs - it >= 4_000 } == true) Action.FAIL else Action.WAIT
         }
+    }
+
+    companion object {
+        const val APPLIED_STABLE_MS = 1_500L
     }
 }
 

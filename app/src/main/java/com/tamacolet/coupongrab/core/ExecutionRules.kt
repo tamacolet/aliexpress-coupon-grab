@@ -122,11 +122,11 @@ object AutomationFlow {
         gate: CouponResultGate? = null,
     ): CouponUiState? {
         val first = read()
-        if (first.state == CouponUiState.APPLIED) return first.state
         if (first.state == CouponUiState.USED) {
             return first.state.takeIf { gate == null || gate.observe(first, nowMs()) == CouponResultGate.Action.USED }
         }
-        if (first.state != CouponUiState.CONFIRMATION) return null
+        // 「取れた」に見えても、確認窓が遅れて出るすき間かもしれないので、門で続くのを確かめる。
+        if (first.state != CouponUiState.CONFIRMATION && first.state != CouponUiState.APPLIED) return null
         var initial: CouponObservation? = first
         return awaitOutcome(gate ?: CouponResultGate(first.validation, nowMs()),
             read = { initial?.also { initial = null } ?: read() }, nowMs = nowMs, approve = approve, pause = pause)

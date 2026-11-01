@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">券取り</string>
+    <string name="accessibility_description">登録したプロモコードだけを適用し、支払い・注文ボタンは操作しません</string>
+</resources>

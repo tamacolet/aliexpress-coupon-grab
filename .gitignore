@@ -1,0 +1,9 @@
+.gradle/
+local.properties
+**/build/
+.idea/
+*.iml
+.DS_Store
+report.html
+report.body.html
+icon/codex-log.md*

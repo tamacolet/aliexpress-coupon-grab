@@ -69,6 +69,7 @@ class JsonStateStore(private val file: File) {
 private fun toJson(state: AppState): JSONObject = JSONObject().apply {
     put("version", 1)
     put("busy", state.busy)
+    put("securityHoldSinceMs", state.securityHoldSinceMs ?: JSONObject.NULL)
     put("nasBusyUntilMs", state.nasBusyUntilMs)
     put("correction", JSONObject().apply {
         put("source", state.correction.source.name)
@@ -177,6 +178,7 @@ private fun fromJson(root: JSONObject): AppState {
         correction = correction,
         nasBusyUntilMs = root.optLong("nasBusyUntilMs"),
         busy = root.optBoolean("busy", false),
+        securityHoldSinceMs = if (root.isNull("securityHoldSinceMs")) null else root.getLong("securityHoldSinceMs"),
         pendingRuns = pendingRuns,
     )
 }

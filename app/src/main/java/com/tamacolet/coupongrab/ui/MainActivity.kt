@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -56,12 +57,15 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.tamacolet.coupongrab.accessibility.AccessibilityWatch
+import com.tamacolet.coupongrab.core.ALI_PACKAGE
+import com.tamacolet.coupongrab.core.ScheduleDeletion
 import com.tamacolet.coupongrab.core.AppState
 import com.tamacolet.coupongrab.core.ClockSource
 import com.tamacolet.coupongrab.core.CodeStatus
 import com.tamacolet.coupongrab.core.CodeValidation
 import com.tamacolet.coupongrab.core.Schedule
 import com.tamacolet.coupongrab.core.ScheduleKind
+import com.tamacolet.coupongrab.service.Notifier
 import com.tamacolet.coupongrab.service.AlarmScheduler
 import com.tamacolet.coupongrab.service.app
 import com.tamacolet.coupongrab.time.NetworkClockSync
@@ -116,6 +120,7 @@ class MainActivity : ComponentActivity() {
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                         modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
                     ) {
+                        item { SecurityWarning() }
                         item { AccessibilityWarning() }
                         item {
                             ClockCard(uiState.value, now, clockMeasuring.value, clockError.value) { measureClock(scope) }
@@ -219,21 +224,41 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun deleteSchedule(scheduleId: String) {
+    private fun deleteSchedule(scheduleId: String, confirmed: Boolean) {
         var deleted = false
         val updated = app.store.update { state ->
-            if (state.busy) {
-                state
-            } else {
-                deleted = true
-                state.copy(
-                    schedules = state.schedules.filterNot { it.id == scheduleId },
-                    pendingRuns = state.pendingRuns.filterNot { it.scheduleId == scheduleId },
-                )
+            ScheduleDeletion.apply(state, scheduleId, confirmed).also {
+                deleted = state.schedules.any { it.id == scheduleId } && it.schedules.none { it.id == scheduleId }
             }
         }
         if (deleted) AlarmScheduler.cancel(this, scheduleId)
         uiState.value = updated
+    }
+
+    @Composable
+    private fun SecurityWarning() {
+        if (uiState.value.securityHoldSinceMs == null) return
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            border = BorderStroke(2.dp, MaterialTheme.colorScheme.error),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+        ) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("アリエクの安全確認が出たので止めています。アリエクでスライダーを手で解いてから再開してください",
+                    color = MaterialTheme.colorScheme.onErrorContainer)
+                Button(onClick = {
+                    uiState.value = app.store.update { it.copy(securityHoldSinceMs = null) }
+                    Notifier(this@MainActivity).clearSecurityHold()
+                    AlarmScheduler.scheduleAll(this@MainActivity)
+                }) { Text("再開") }
+                TextButton(onClick = {
+                    packageManager.getLaunchIntentForPackage(ALI_PACKAGE)?.let {
+                        it.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                        startActivity(it)
+                    }
+                }) { Text("アリエクを開く") }
+            }
+        }
     }
 
     @Composable
@@ -388,9 +413,10 @@ private fun ScheduleEditorDialog(
     busy: Boolean,
     onDismiss: () -> Unit,
     onSave: (ScheduleEditorDraft) -> String?,
-    onDelete: (String) -> Unit,
+    onDelete: (String, Boolean) -> Unit,
 ) {
     var draft by remember(initial.id) { mutableStateOf(initial) }
+    var confirmDelete by remember(initial.id) { mutableStateOf(false) }
     var attempted by remember(initial.id) { mutableStateOf(false) }
     var error by remember(initial.id) { mutableStateOf<String?>(null) }
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
@@ -401,7 +427,7 @@ private fun ScheduleEditorDialog(
                     TextButton(onClick = onDismiss) { Text("閉じる") }
                     if (existing) {
                         TextButton(
-                            onClick = { onDelete(draft.id); onDismiss() },
+                            onClick = { confirmDelete = true },
                             enabled = !busy,
                         ) { Text("削除") }
                     }
@@ -489,6 +515,20 @@ private fun ScheduleEditorDialog(
             }
         }
     }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("この予定を消しますか") },
+            confirmButton = {
+                TextButton(enabled = !busy, onClick = {
+                    onDelete(draft.id, true)
+                    confirmDelete = false
+                    onDismiss()
+                }) { Text("消す") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("やめる") } },
+        )
+    }
 }
 
 private fun correctedNow(state: AppState): Long {
@@ -524,6 +564,8 @@ private fun historyLabel(event: String): String = when (event) {
     "apply_retry" -> "適用を再試行"
     "code_error" -> "画面操作に失敗"
     "repeat_preempted" -> "予約を先に実行"
+    "security_hold" -> "安全確認のため停止"
+    "security_hold_skip" -> "安全確認のため予定を見送り"
     "code_applied" -> "クーポンを取得"
     "code_used" -> "使用済み"
     "code_failure" -> "コードの取得に失敗"

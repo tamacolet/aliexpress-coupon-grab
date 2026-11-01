@@ -49,6 +49,25 @@ class Notifier(private val context: Context) {
         )
     }
 
+    fun securityHold() {
+        if (!canNotify()) return
+        val open = PendingIntent.getActivity(
+            context, 4, android.content.Intent(context, com.tamacolet.coupongrab.ui.MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val text = "スマホでアリエクを開いて手でスライダーを解き、アプリの「再開」を押してください"
+        manager.notify(4, NotificationCompat.Builder(context, CHANNEL_ALERT)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("アリエクの安全確認が出たので休んでいます")
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .build())
+    }
+
+    fun clearSecurityHold() = manager.cancel(4)
+
     fun running(text: String = "登録したクーポンを準備しています"): Notification =
         NotificationCompat.Builder(context, CHANNEL_RUNNING)
             .setSmallIcon(R.drawable.ic_notification)

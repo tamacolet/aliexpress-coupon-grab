@@ -52,6 +52,7 @@ data class AppState(
     val correction: TimeCorrection = TimeCorrection(),
     val nasBusyUntilMs: Long = 0,
     val busy: Boolean = false,
+    val securityHoldSinceMs: Long? = null,
     val pendingRuns: List<RunRequest> = emptyList(),
 ) {
     fun append(entry: HistoryEntry): AppState =
@@ -120,6 +121,7 @@ object ScheduleRules {
 
     sealed interface NasDecision {
         data object Execute : NasDecision
+        data object SecurityHold : NasDecision
         data class Defer(val delayMs: Long = NAS_RETRY_MS) : NasDecision
     }
 

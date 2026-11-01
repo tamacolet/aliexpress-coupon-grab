@@ -108,7 +108,7 @@ class CouponResultGateTest {
         assertEquals(listOf("CONFIRMATION", "approve", "wait", "DIALOG", "wait", "UNKNOWN", "wait", "APPLIED", "prepare-next"), actions)
     }
 
-    @Test fun `execution recovery approves and awaits applied before failing only the next code`() = runBlocking {
+    @Test fun `execution recovery approves previous code and rotates the preparing code`() = runBlocking {
         val rotation = CodeRotation(listOf("A", "B"))
         rotation.complete("A", null)
         val results = mutableListOf<Pair<String, CodeStatus>>()
@@ -122,21 +122,22 @@ class CouponResultGateTest {
             if (rotation.finishIfPending("A", CodeStatus.APPLIED)) results += "A" to CodeStatus.APPLIED
         }, cancel = { fail("execution must never cancel") })
         actions += "close"
-        if (rotation.finishIfPending("B", CodeStatus.FAILURE)) results += "B" to CodeStatus.FAILURE
+        if (rotation.afterRecovery("B", previousCompleted = true)) results += "B" to CodeStatus.FAILURE
         if (rotation.finishIfPending("A", CodeStatus.FAILURE)) fail("success must be retained")
         assertEquals(listOf("CONFIRMATION", "approve", "wait", "UNKNOWN", "wait", "APPLIED", "close"), actions)
-        assertEquals(listOf("A" to CodeStatus.APPLIED, "B" to CodeStatus.FAILURE), results)
+        assertEquals(listOf("A" to CodeStatus.APPLIED), results)
+        assertEquals(listOf("B"), rotation.pending())
         AutomationFlow.resolveConfirmation(cleaningUp = true,
             settle = { fail("cleanup must not approve") }, cancel = { actions += "cancel" })
         assertEquals("cancel", actions.last())
     }
 
-    @Test fun `stale used waits for validation change or 1200ms`() {
+    @Test fun `stale used never completes based on elapsed time alone`() {
         val used = ValidationSnapshot("使用済み", false)
         val gate = CouponResultGate(used, 100)
         val observation = observation(CouponUiState.USED, used)
         assertEquals(CouponResultGate.Action.WAIT, gate.observe(observation, 1299))
-        assertEquals(CouponResultGate.Action.USED, gate.observe(observation, 1300))
+        assertEquals(CouponResultGate.Action.WAIT, gate.observe(observation, 1_000_000))
         assertEquals(CouponResultGate.Action.USED,
             CouponResultGate(used, 100).observe(observation.copy(validation = used.copy(warning = true)), 101))
     }
@@ -177,7 +178,8 @@ class CouponResultGateTest {
                 var now = 0L
                 var approvals = 0
                 val result = AutomationFlow.settleBeforeNext(
-                    read = { observation(if (now < disappearAt) CouponUiState.CONFIRMATION else state) },
+                    read = { observation(if (now < disappearAt) CouponUiState.CONFIRMATION else state,
+                        if (now >= disappearAt && state == CouponUiState.USED) ValidationSnapshot("使用済み", false) else stale) },
                     nowMs = { now }, approve = { approvals++ }, pause = { now += 100 })
                 assertEquals(state, result)
                 assertEquals(if (disappearAt == 100L) 1 else 2, approvals)

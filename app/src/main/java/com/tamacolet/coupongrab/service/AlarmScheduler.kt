@@ -126,9 +126,15 @@ class AlarmReceiver : android.content.BroadcastReceiver() {
             // 時計補正や端末時計の変更で早く届いた場合は、現在の時刻で登録し直す。
             val pending = goAsync()
             kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch {
+                var check: kotlinx.coroutines.Job? = null
                 try {
-                    AlarmScheduler.schedule(context.applicationContext, schedule)?.join()
+                    // goAsync の受信期限より短くし、別スコープの確認も残さない。
+                    kotlinx.coroutines.withTimeoutOrNull(8_000) {
+                        check = AlarmScheduler.schedule(context.applicationContext, schedule)
+                        check?.join()
+                    }
                 } finally {
+                    check?.cancel()
                     pending.finish()
                 }
             }

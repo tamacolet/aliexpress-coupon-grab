@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.view.WindowManager
 import com.tamacolet.coupongrab.core.ExecutionPolicy
+import com.tamacolet.coupongrab.core.SecurityCheckException
 import kotlinx.coroutines.CompletableDeferred
 import com.tamacolet.coupongrab.core.AutomationFlow
 import java.lang.ref.WeakReference
@@ -88,6 +89,7 @@ class WakeActivity : Activity() {
 
         /** onResume とキーガード解除を待った後、WakeActivity またはユーザー補助から開く。 */
         fun launchCart(fallback: Context, intent: Intent) {
+            if (fallback.app.store.load().securityHoldSinceMs != null) throw SecurityCheckException()
             val resumedActivity = active?.get()?.takeIf { it.resumed }
             (resumedActivity ?: fallback).startActivity(intent)
         }

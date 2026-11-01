@@ -6,16 +6,17 @@ class CodeRotation(codes: List<String>) {
     private val budgetMs = 15_000L * codes.size
     private var startedAtMs: Long? = null
     private var lastPressAtMs: Long? = null
+    private var presses = 0
 
     init { require(codes.isNotEmpty() && codes.distinct().size == codes.size) }
 
     fun start(nowMs: Long) { if (startedAtMs == null) startedAtMs = nowMs }
-    fun pressed(nowMs: Long) { start(nowMs); lastPressAtMs = nowMs }
+    fun pressed(nowMs: Long) { check(presses < MAX_PRESSES); start(nowMs); lastPressAtMs = nowMs; presses++ }
     /** 1秒ごとに31回押すとアリエクの安全確認（スライダー）が出た（7a 11-01）。押す間を空ける。 */
     fun waitBeforePressMs(nowMs: Long): Long =
         lastPressAtMs?.let { (it + MIN_PRESS_GAP_MS - nowMs).coerceAtLeast(0) } ?: 0
     fun remainingMs(nowMs: Long): Long? = startedAtMs?.let { (budgetMs - (nowMs - it)).coerceAtLeast(0) }
-    fun expired(nowMs: Long): Boolean = remainingMs(nowMs) == 0L
+    fun expired(nowMs: Long): Boolean = presses >= MAX_PRESSES || remainingMs(nowMs) == 0L
     fun next(nowMs: Long): String? = queue.firstOrNull().takeUnless { expired(nowMs) }
     fun pending(): List<String> = queue.toList()
 
@@ -30,7 +31,17 @@ class CodeRotation(codes: List<String>) {
         queue = queue.filterNot { it == code } + if (status == null) listOf(code) else emptyList()
     }
 
-    companion object { const val MIN_PRESS_GAP_MS = 2_000L }
+    /** 前の券の結果を回収したら、準備中の券は失敗にせず最後へ戻す。 */
+    fun afterRecovery(attempting: String?, previousCompleted: Boolean): Boolean {
+        if (attempting == null) return false
+        if (previousCompleted) { complete(attempting, null); return false }
+        return finishIfPending(attempting, CodeStatus.FAILURE)
+    }
+
+    companion object {
+        const val MIN_PRESS_GAP_MS = 2_000L
+        const val MAX_PRESSES = 25
+    }
 }
 
 const val SECURITY_CHECK_REASON = "アリエクの安全確認（スライダー）が出たので止めました。スマホで手で解いてください"
@@ -76,11 +87,9 @@ class CouponResultGate(private val before: ValidationSnapshot, private val press
             approvedAtMs = nowMs
             return Action.APPROVE
         }
-        // 確認窓が消えた後の検証表示は、今回の承認に対する結果として読む。
-        if (approvedAtMs != null) validationChanged = true
         return when (observation.state) {
-            CouponUiState.USED -> if (validationChanged || nowMs - pressedAtMs >= 1_200) Action.USED else Action.WAIT
-            CouponUiState.INVALID -> if (validationChanged || nowMs - pressedAtMs >= 1_200) Action.INVALID else Action.WAIT
+            CouponUiState.USED -> if (validationChanged) Action.USED else Action.WAIT
+            CouponUiState.INVALID -> if (approvedAtMs != null || validationChanged || nowMs - pressedAtMs >= 1_200) Action.INVALID else Action.WAIT
             else -> if (approvedAtMs?.let { nowMs - it >= 4_000 } == true) Action.FAIL else Action.WAIT
         }
     }

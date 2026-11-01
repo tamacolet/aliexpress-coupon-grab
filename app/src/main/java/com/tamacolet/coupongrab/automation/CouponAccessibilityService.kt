@@ -56,6 +56,7 @@ class CouponAccessibilityService : AccessibilityService() {
      * キーボードが出る瞬間は「今使っている窓」が取れないので、窓の重なり順で選ぶ。
      */
     fun root(activity: String? = null): AccessibilityNodeInfo {
+        if (SecurityCheckException.isSecurityScreen(currentActivity)) throw SecurityCheckException()
         var node: AccessibilityNodeInfo? = null
         for (attempt in 0 until 5) {
             node = windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }?.root

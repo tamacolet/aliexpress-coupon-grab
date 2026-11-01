@@ -1,5 +1,8 @@
 package com.tamacolet.coupongrab.core
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ensureActive
+
 /** アラーム受信時に先に保存し、Service 未起動・プロセス再作成でも要求を失わない。 */
 data class RunRequest(
     val scheduleId: String,
@@ -64,6 +67,32 @@ class AutomationException(message: String) : Exception(message)
 
 /** Android に依存しない結果判定と待機。画面の読み直しも呼び出し側から渡す。 */
 object AutomationFlow {
+    suspend fun <T : Any> waitFor(
+        timeoutMs: Long, activity: () -> String?, nowMs: () -> Long,
+        read: suspend () -> T?, pause: suspend () -> Unit,
+    ): T {
+        val started = nowMs()
+        while (true) {
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            checkSecurity(activity())
+            read()?.let { return it }
+            if (nowMs() - started >= timeoutMs) throw AutomationException("画面の待機がタイムアウトしました")
+            pause()
+        }
+    }
+
+    /** 準備中の例外でも占有状態を必ず解放する。 */
+    suspend fun <T> withCleanup(action: suspend () -> T, cleanup: () -> Unit): T =
+        try { action() } finally { cleanup() }
+
+    fun checkSecurity(activity: String?) {
+        if (SecurityCheckException.isSecurityScreen(activity)) throw SecurityCheckException()
+    }
+
+    inline fun <T> recoverableRead(read: () -> T): Result<T> = runCatching(read).onFailure {
+        if (it is SecurityCheckException || it is CancellationException) throw it
+    }
+
     suspend fun awaitOutcome(
         gate: CouponResultGate,
         read: () -> CouponObservation,
@@ -90,12 +119,16 @@ object AutomationFlow {
         nowMs: () -> Long,
         approve: suspend () -> Unit,
         pause: suspend () -> Unit,
+        gate: CouponResultGate? = null,
     ): CouponUiState? {
         val first = read()
-        if (first.state == CouponUiState.APPLIED || first.state == CouponUiState.USED) return first.state
+        if (first.state == CouponUiState.APPLIED) return first.state
+        if (first.state == CouponUiState.USED) {
+            return first.state.takeIf { gate == null || gate.observe(first, nowMs()) == CouponResultGate.Action.USED }
+        }
         if (first.state != CouponUiState.CONFIRMATION) return null
         var initial: CouponObservation? = first
-        return awaitOutcome(CouponResultGate(first.validation, nowMs()),
+        return awaitOutcome(gate ?: CouponResultGate(first.validation, nowMs()),
             read = { initial?.also { initial = null } ?: read() }, nowMs = nowMs, approve = approve, pause = pause)
     }
 
@@ -162,18 +195,36 @@ object AutomationFlow {
 
 /** NAS の確認と端末の占有を、同じ保存処理の最新状態から決める。 */
 object RunAdmission {
-    fun claim(state: AppState, request: RunRequest, nowMs: Long): Pair<AppState, ScheduleRules.NasDecision?> {
+    fun claim(state: AppState, request: RunRequest, nowMs: Long, elapsedMs: Long = 0): Pair<AppState, ScheduleRules.NasDecision?> {
         val schedule = state.schedules.firstOrNull { it.id == request.scheduleId }
             ?: return state to null
+        if (state.securityHoldSinceMs != null) {
+            val held = state.copy(schedules = state.schedules.map {
+                if (it.id == schedule.id && it.kind == ScheduleKind.REPEAT && it.enabled) {
+                    it.copy(nextRunAtMs = nowMs + it.repeatMinutes * 60_000L)
+                } else it
+            }).append(HistoryEntry(nowMs, elapsedMs, "security_hold_skip", schedule.id, detail = SECURITY_CHECK_REASON))
+            return held to ScheduleRules.NasDecision.SecurityHold
+        }
         if (!ExecutionPolicy.accepts(schedule, request, nowMs)) return state to null
         val decision = ScheduleRules.nasDecision(schedule, nowMs, state.nasBusyUntilMs,
             ScheduleRules.nextExactAtMs(state.schedules))
         val updated = when (decision) {
             ScheduleRules.NasDecision.Execute -> state.copy(busy = true)
+            ScheduleRules.NasDecision.SecurityHold -> state
             is ScheduleRules.NasDecision.Defer -> state.copy(schedules = state.schedules.map {
                 if (it.id == schedule.id) it.copy(nextRunAtMs = nowMs + decision.delayMs) else it
             })
         }
         return updated to decision
     }
+}
+
+/** 確認の取り消し・実行中は、予定も待機要求も変更しない。 */
+object ScheduleDeletion {
+    fun apply(state: AppState, scheduleId: String, confirmed: Boolean): AppState =
+        if (!confirmed || state.busy) state else state.copy(
+            schedules = state.schedules.filterNot { it.id == scheduleId },
+            pendingRuns = state.pendingRuns.filterNot { it.scheduleId == scheduleId },
+        )
 }

@@ -6,6 +6,7 @@ object HistoryRules {
     private val resultEvents = setOf("code_applied", "code_used", "code_failure")
 
     fun record(state: AppState, entry: HistoryEntry): AppState = when (entry.event) {
+        "security_hold", "security_hold_skip" -> state.append(entry)
         "apply" -> state.append(atActualPress(entry))
         "apply_retry" -> state.failPreviousAttempt(entry).append(atActualPress(entry))
         in resultEvents -> state.completeAttempt(entry)

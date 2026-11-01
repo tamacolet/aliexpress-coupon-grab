@@ -11,6 +11,8 @@ import com.tamacolet.coupongrab.accessibility.AccessibilityWatch
 import com.tamacolet.coupongrab.automation.CouponAutomation
 import com.tamacolet.coupongrab.automation.ExactPreemptionException
 import com.tamacolet.coupongrab.core.AutomationFlow
+import com.tamacolet.coupongrab.core.SecurityCheckException
+import com.tamacolet.coupongrab.core.SECURITY_CHECK_REASON
 import com.tamacolet.coupongrab.core.RunAdmission
 import com.tamacolet.coupongrab.core.AppState
 import com.tamacolet.coupongrab.core.ClockSource
@@ -108,6 +110,13 @@ class GrabService : Service() {
         val schedule = initial.schedules.firstOrNull { it.id == request.scheduleId && it.enabled }
             ?: return RunDisposition.REMOVE
         val now = correctedNow(initial)
+        if (initial.securityHoldSinceMs != null) {
+            app.store.updateWithResult { RunAdmission.claim(it, request, correctedNow(it), SystemClock.elapsedRealtime()) }
+            if (schedule.kind == ScheduleKind.REPEAT) {
+                app.store.load().schedules.firstOrNull { it.id == schedule.id }?.let { AlarmScheduler.schedule(this, it) }
+            }
+            return RunDisposition.REMOVE
+        }
         if (!ExecutionPolicy.accepts(schedule, request, now)) {
             AlarmScheduler.schedule(this, schedule)
             return RunDisposition.REMOVE
@@ -119,7 +128,7 @@ class GrabService : Service() {
             return RunDisposition.REMOVE
         }
         val decision = app.store.updateWithResult { state ->
-            RunAdmission.claim(state, request, correctedNow(state))
+            RunAdmission.claim(state, request, correctedNow(state), SystemClock.elapsedRealtime())
         }
         when (decision) {
             is ScheduleRules.NasDecision.Defer -> {
@@ -128,65 +137,73 @@ class GrabService : Service() {
                     ?.let { AlarmScheduler.schedule(this, it) }
                 return RunDisposition.REMOVE
             }
+            ScheduleRules.NasDecision.SecurityHold -> return RunDisposition.REMOVE
             ScheduleRules.NasDecision.Execute -> Unit
             null -> return RunDisposition.REMOVE
         }
 
-        if (schedule.kind == ScheduleKind.REPEAT) AccessibilityWatch.check(this, schedule)
-        else AccessibilityWatch.observeConnection(this)
-        wakeLock.acquire(ExecutionPolicy.MAX_EXECUTION_MS)
         var failure: String? = null
         var finalize = false
         var preempted = false
-        try {
-            withTimeout(ExecutionPolicy.MAX_EXECUTION_MS) {
-                val correction = NetworkClockSync().measure()
-                app.store.update { it.copy(correction = correction) }
-                if (correction.source == ClockSource.NONE) notifier.clockFallback()
-                record(
-                    "clock", schedule.id, "",
-                    "source=${correction.source} offsetMs=${correction.offsetMs} rttMs=${correction.rttMs}",
-                )
-                val clock = systemClock(correction)
-                val latest = app.store.load().schedules.firstOrNull { it.id == schedule.id && it.enabled }
-                if (latest != null) {
-                    val targets = ScheduleRules.pendingCodes(latest)
-                    if (targets.isNotEmpty()) {
-                        CouponAutomation(
-                            context = this@GrabService,
-                            clock = clock,
-                            onEvent = { event, code, detail -> record(event, latest.id, code, detail) },
-                            onCode = { code, status, detail -> updateCode(latest.id, code, status, detail) },
-                            shouldYieldForExact = {
-                                latest.kind == ScheduleKind.REPEAT &&
-                                    app.store.load().pendingRuns.any { it.kind == ScheduleKind.EXACT }
-                            },
-                        ).execute(targets, latest.nextRunAtMs)
+        AutomationFlow.withCleanup(action = {
+            try {
+                if (schedule.kind == ScheduleKind.REPEAT) AccessibilityWatch.check(this, schedule)
+                else AccessibilityWatch.observeConnection(this)
+                wakeLock.acquire(ExecutionPolicy.MAX_EXECUTION_MS)
+                withTimeout(ExecutionPolicy.MAX_EXECUTION_MS) {
+                    val correction = NetworkClockSync().measure()
+                    app.store.update { it.copy(correction = correction) }
+                    if (correction.source == ClockSource.NONE) notifier.clockFallback()
+                    record(
+                        "clock", schedule.id, "",
+                        "source=${correction.source} offsetMs=${correction.offsetMs} rttMs=${correction.rttMs}",
+                    )
+                    val clock = systemClock(correction)
+                    val latest = app.store.load().schedules.firstOrNull { it.id == schedule.id && it.enabled }
+                    if (latest != null) {
+                        val targets = ScheduleRules.pendingCodes(latest)
+                        if (targets.isNotEmpty()) {
+                            CouponAutomation(
+                                context = this@GrabService,
+                                clock = clock,
+                                onEvent = { event, code, detail -> record(event, latest.id, code, detail) },
+                                onCode = { code, status, detail -> updateCode(latest.id, code, status, detail) },
+                                shouldYieldForExact = {
+                                    latest.kind == ScheduleKind.REPEAT &&
+                                        app.store.load().pendingRuns.any { it.kind == ScheduleKind.EXACT }
+                                },
+                            ).execute(targets, latest.nextRunAtMs)
+                        }
                     }
                 }
+                finalize = true
+            } catch (_: ExactPreemptionException) {
+                // 繰り返し要求はキューに残し、次の選択で時刻指定を必ず先に実行する。
+                preempted = true
+                record("repeat_preempted", schedule.id, "", "exact queued")
+            } catch (_: SecurityCheckException) {
+                app.store.update { it.copy(securityHoldSinceMs = it.securityHoldSinceMs ?: correctedNow(it)) }
+                record("security_hold", schedule.id, "", SECURITY_CHECK_REASON)
+                notifier.securityHold()
+            } catch (_: TimeoutCancellationException) {
+                failure = "実行時間の上限を超えました"
+                failLatestPending(schedule.id, checkNotNull(failure))
+                finalize = true
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                failure = error.message ?: error.javaClass.simpleName
+                // 初期スナップショットではなく最新の pending だけを失敗にし、成功を後退させない。
+                failLatestPending(schedule.id, checkNotNull(failure))
+                finalize = true
+            } finally {
+                AccessibilityWatch.observeConnection(this)
+                if (finalize) finalizeSchedule(schedule.id, failure)
             }
-            finalize = true
-        } catch (_: ExactPreemptionException) {
-            // 繰り返し要求はキューに残し、次の選択で時刻指定を必ず先に実行する。
-            preempted = true
-            record("repeat_preempted", schedule.id, "", "exact queued")
-        } catch (_: TimeoutCancellationException) {
-            failure = "実行時間の上限を超えました"
-            failLatestPending(schedule.id, failure)
-            finalize = true
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (error: Throwable) {
-            failure = error.message ?: error.javaClass.simpleName
-            // 初期スナップショットではなく最新の pending だけを失敗にし、成功を後退させない。
-            failLatestPending(schedule.id, failure)
-            finalize = true
-        } finally {
-            AccessibilityWatch.observeConnection(this)
-            if (finalize) finalizeSchedule(schedule.id, failure)
+        }, cleanup = {
             app.store.update { it.copy(busy = false) }
             if (wakeLock.isHeld) wakeLock.release()
-        }
+        })
         return if (preempted) RunDisposition.KEEP else RunDisposition.REMOVE
     }
 

@@ -99,7 +99,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 Scaffold(topBar = {
-                    TopAppBar(title = { Text(if (uiState.value.busy) "券取り（実行中）" else "券取り") })
+                    TopAppBar(title = { Text(if (uiState.value.busy) "アリエク券取り（実行中）" else "アリエク券取り") })
                 }) { padding ->
                     LazyColumn(
                         contentPadding = padding,

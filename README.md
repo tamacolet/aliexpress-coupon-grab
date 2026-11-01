@@ -1,4 +1,4 @@
-# 券取り
+# アリエク券取り
 
 Android 12（API 31）以降向けの、AliExpress プロモコード自動適用アプリです。Kotlin / Jetpack Compose Material 3 製で、JST の秒指定と 1〜60 分の繰り返し（既定 5 分）に対応します。
 

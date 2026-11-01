@@ -24,7 +24,7 @@ class Notifier(private val context: Context) {
     fun running(text: String = "登録したクーポンを準備しています"): Notification =
         NotificationCompat.Builder(context, CHANNEL_RUNNING)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("券取り")
+            .setContentTitle("アリエク券取り")
             .setContentText(text)
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)

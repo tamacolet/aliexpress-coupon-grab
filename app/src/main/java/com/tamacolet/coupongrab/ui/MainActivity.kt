@@ -45,6 +45,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,7 +64,11 @@ import com.tamacolet.coupongrab.core.Schedule
 import com.tamacolet.coupongrab.core.ScheduleKind
 import com.tamacolet.coupongrab.service.AlarmScheduler
 import com.tamacolet.coupongrab.service.app
+import com.tamacolet.coupongrab.time.NetworkClockSync
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -80,6 +85,8 @@ private data class EditorSession(val draft: ScheduleEditorDraft, val existing: B
 class MainActivity : ComponentActivity() {
     private val uiState = mutableStateOf(AppState())
     private val permissionRevision = mutableIntStateOf(0)
+    private val clockMeasuring = mutableStateOf(false)
+    private val clockError = mutableStateOf<String?>(null)
     private val notificationPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { refresh() }
@@ -91,6 +98,7 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 var now by remember { mutableLongStateOf(correctedNow(uiState.value)) }
                 var editor by remember { mutableStateOf<EditorSession?>(null) }
+                val scope = rememberCoroutineScope()
                 LaunchedEffect(Unit) {
                     while (true) {
                         val state = app.store.load()
@@ -109,7 +117,9 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
                     ) {
                         item { AccessibilityWarning() }
-                        item { ClockCard(uiState.value, now) }
+                        item {
+                            ClockCard(uiState.value, now, clockMeasuring.value, clockError.value) { measureClock(scope) }
+                        }
                         item { PermissionCard() }
                         item {
                             Button(
@@ -158,6 +168,28 @@ class MainActivity : ComponentActivity() {
         uiState.value = app.store.load()
         permissionRevision.intValue++
         AccessibilityWatch.observeConnection(this)
+    }
+
+    /** 予定の実行前と同じ測り方で、今すぐ時計のずれを測る。券取りの実行中は測らない。 */
+    private fun measureClock(scope: CoroutineScope) {
+        if (clockMeasuring.value || app.store.load().busy) return
+        clockMeasuring.value = true
+        clockError.value = null
+        scope.launch {
+            try {
+                val correction = NetworkClockSync().measure()
+                uiState.value = app.store.update { if (it.busy) it else it.copy(correction = correction) }
+                if (correction.source == ClockSource.NONE) {
+                    clockError.value = "ネットの時計に届きませんでした。通信を確かめて、もう一度押してください"
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                clockError.value = "測れませんでした（${error.javaClass.simpleName}）"
+            } finally {
+                clockMeasuring.value = false
+            }
+        }
     }
 
     private fun saveSchedule(draft: ScheduleEditorDraft, existing: Boolean): String? {
@@ -282,18 +314,36 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun ClockCard(state: AppState, now: Long) {
+private fun ClockCard(state: AppState, now: Long, measuring: Boolean, error: String?, onMeasure: () -> Unit) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             val correction = state.correction
-            if (correction.measuredAtMs == 0L) {
-                Text("時計のずれ 未測定", style = MaterialTheme.typography.titleMedium)
-            } else {
-                val measured = clockMeasureFormat.format(Instant.ofEpochMilli(correction.measuredAtMs).atZone(jst))
-                val drift = String.format(Locale.JAPAN, "%+.2f", -correction.offsetMs / 1_000.0)
-                Text("時計のずれ ${drift}秒（$measured 測定）", style = MaterialTheme.typography.titleMedium)
-                Text("測定方式: ${clockSourceLabel(correction.source)}")
+            val measured = correction.measuredAtMs > 0L
+            when {
+                measuring -> {
+                    Text("時計のずれ 測定中…", style = MaterialTheme.typography.titleMedium)
+                    Text("ネットの時計と比べています（最大12秒）", style = MaterialTheme.typography.bodySmall)
+                }
+                !measured -> {
+                    Text("時計のずれ 未測定", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "予定を実行する直前に毎回自動で測ります。今のずれを見たい時は「今すぐ測る」を押してください",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                else -> {
+                    val at = clockMeasureFormat.format(Instant.ofEpochMilli(correction.measuredAtMs).atZone(jst))
+                    val drift = String.format(Locale.JAPAN, "%+.2f", -correction.offsetMs / 1_000.0)
+                    Text("時計のずれ ${drift}秒（$at 測定）", style = MaterialTheme.typography.titleMedium)
+                    Text("測定方式: ${clockSourceLabel(correction.source)}")
+                    Text("予定を実行する直前にも毎回測り直します", style = MaterialTheme.typography.bodySmall)
+                }
             }
+            error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            OutlinedButton(onClick = onMeasure, enabled = !measuring && !state.busy) {
+                Text(if (measured) "測り直す" else "今すぐ測る")
+            }
+            if (state.busy) Text("券取りの実行中は測れません", style = MaterialTheme.typography.bodySmall)
             if (state.nasBusyUntilMs > now) Text("NAS側が実行中のため、繰り返し予定は待機します")
         }
     }
@@ -461,7 +511,7 @@ private fun statusLabel(status: CodeStatus): String = when (status) {
 private fun clockSourceLabel(source: ClockSource): String = when (source) {
     ClockSource.SNTP -> "SNTP"
     ClockSource.HTTP_DATE -> "HTTP（秒精度）"
-    ClockSource.NONE -> "なし"
+    ClockSource.NONE -> "測れず（スマホの時計のまま）"
 }
 
 private fun historyLabel(event: String): String = when (event) {

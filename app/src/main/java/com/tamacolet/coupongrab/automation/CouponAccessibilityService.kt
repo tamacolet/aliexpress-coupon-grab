@@ -121,7 +121,11 @@ fun AccessibilityNodeInfo.snapshot(): SafetyNode = SafetyNode(
     children = List(childCount) { index -> getChild(index)?.snapshot() ?: SafetyNode(readable = false) },
 )
 
+/** 画面を読むための一覧。読めない子は飛ばす（押す前の安全検査は nodesAt の厳しい一覧を使う）。 */
 fun AccessibilityNodeInfo.flatten(): List<AccessibilityNodeInfo> =
+    listOf(this) + List(childCount) { index -> getChild(index) }.filterNotNull().flatMap { it.flatten() }
+
+private fun AccessibilityNodeInfo.flattenStrict(): List<AccessibilityNodeInfo> =
     AliIds.flattenReadable(this) { node -> List(node.childCount) { node.getChild(it) } }
 
 fun AccessibilityNodeInfo.byId(shortName: String): AccessibilityNodeInfo? =
@@ -189,7 +193,7 @@ private fun AccessibilityNodeInfo.nodesAt(x: Int, y: Int): List<SafetyNode> {
     var top = this
     while (true) top = top.parent ?: break
     val bounds = Rect()
-    return top.flatten().filter {
+    return top.flattenStrict().filter {
         it.isVisibleToUser && bounds.also(it::getBoundsInScreen).contains(x, y)
     }.map { if (it.isClickable) it.snapshot() else it.shallowSnapshot() }
 }

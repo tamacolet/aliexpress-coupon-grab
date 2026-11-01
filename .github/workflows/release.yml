@@ -1,0 +1,59 @@
+name: Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_APK: aliexpress-coupon-grab-${{ github.ref_name }}.apk
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v6
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-37.0'
+      - name: Build signed release
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          CG_KEYSTORE_FILE: ${{ runner.temp }}/coupon-grab-release.jks
+          CG_KEYSTORE_PASSWORD: ${{ secrets.CG_KEYSTORE_PASSWORD }}
+          CG_KEY_ALIAS: ${{ secrets.CG_KEY_ALIAS }}
+          CG_KEY_PASSWORD: ${{ secrets.CG_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f -- "$CG_KEYSTORE_FILE"' EXIT
+          for name in KEYSTORE_BASE64 CG_KEYSTORE_PASSWORD CG_KEY_ALIAS CG_KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing signing secret: $name"
+              exit 1
+            fi
+          done
+          case "$RELEASE_TAG" in
+            *[!a-zA-Z0-9._-]*) echo '::error::Tag must use letters, numbers, dots, underscores or hyphens'; exit 1 ;;
+          esac
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$CG_KEYSTORE_FILE"
+          test -s "$CG_KEYSTORE_FILE"
+          ./gradlew testDebugUnitTest assembleRelease
+          cp -- app/build/outputs/apk/release/app-release.apk "$RELEASE_APK"
+      - name: Remove signing key
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f -- "$RUNNER_TEMP/coupon-grab-release.jks"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.RELEASE_APK }}
+          fail_on_unmatched_files: true

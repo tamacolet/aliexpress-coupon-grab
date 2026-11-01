@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
+import com.tamacolet.coupongrab.accessibility.AccessibilityWatch
 import com.tamacolet.coupongrab.core.ALI_PACKAGE
 import com.tamacolet.coupongrab.core.ActivityEventReducer
 import com.tamacolet.coupongrab.core.AliIds
@@ -23,6 +24,7 @@ class CouponAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        AccessibilityWatch.observeConnection(this)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -80,6 +82,8 @@ class CouponAccessibilityService : AccessibilityService() {
 
     companion object {
         @Volatile private var instance: CouponAccessibilityService? = null
+
+        fun isConnected(): Boolean = instance != null
 
         suspend fun awaitConnected(timeoutMs: Long = 5_000): CouponAccessibilityService {
             val started = android.os.SystemClock.elapsedRealtime()

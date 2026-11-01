@@ -85,6 +85,14 @@ class CouponStateDeciderTest {
         assertEquals(CouponUiState.INVALID, decide(SafetyNode(resourceId = id("iv_warning_icon"))))
     }
 
+    @Test fun `確認文は見える全ての文字で判定し非表示は無視する`() {
+        assertEquals(CouponUiState.CONFIRMATION, decide(SafetyNode(text = "このコードを本当に適用しますか？")))
+        assertEquals(CouponUiState.CONFIRMATION, decide(SafetyNode(contentDescription = "本当に適用しますか")))
+        assertEquals(CouponUiState.UNKNOWN, decide(SafetyNode(text = "本当に適用しますか", visible = false)))
+        assertEquals(CouponUiState.CONFIRMATION, decide(SafetyNode(text = "本当に適用しますか"),
+            SafetyNode(resourceId = id("iv_warning_icon"))))
+    }
+
     @Test fun `適用済みは割引額と完全一致コードの両方を要求する`() {
         val discount = SafetyNode(text = "割引額")
         assertEquals(CouponUiState.UNKNOWN, decide(discount))
@@ -149,7 +157,7 @@ class UnreadableNodeTest {
             val node = SafetyNode(resourceId = AliIds.qualified(it), clickable = true)
             assertTrue(PaymentSafety.canClick(node, node, emptyList()))
         }
-        listOf("購入手続きへ", "プロモコード", "適用", "承認", "中止する").forEach {
+        listOf("購入手続きへ", "プロモコード", "適用", "承認", "取り消し", "中止する").forEach {
             val node = SafetyNode(text = it, clickable = true)
             assertTrue(PaymentSafety.canClick(node, node, emptyList()))
         }

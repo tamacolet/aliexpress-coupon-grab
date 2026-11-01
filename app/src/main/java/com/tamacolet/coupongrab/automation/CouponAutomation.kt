@@ -1,5 +1,9 @@
 package com.tamacolet.coupongrab.automation
 
+import com.tamacolet.coupongrab.core.AutomationDiagnostics
+import com.tamacolet.coupongrab.core.CodeRotation
+import com.tamacolet.coupongrab.core.CouponObservation
+import com.tamacolet.coupongrab.core.CouponResultGate
 import com.tamacolet.coupongrab.core.AutomationFlow
 import android.content.Context
 import android.content.Intent
@@ -27,6 +31,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 class ExactPreemptionException : Exception("時刻指定の実行を優先します")
 
@@ -39,9 +44,14 @@ class CouponAutomation(
 ) {
     private var checkoutAttempted = false
     private var cleaningUp = false
+    private var hasPressed = false
+    private var rotation: CodeRotation? = null
+    private class BudgetExpired : Exception()
+    private class ConfirmationAppeared : Exception()
 
     private fun yieldIfExactNeeded() {
         if (!cleaningUp && shouldYieldForExact()) throw ExactPreemptionException()
+        if (!cleaningUp && rotation?.expired(SystemClock.elapsedRealtime()) == true) throw BudgetExpired()
     }
 
     suspend fun execute(codes: List<CouponCode>, targetAtMs: Long) {
@@ -60,31 +70,68 @@ class CouponAutomation(
             }
             WakeActivity.launchCart(accessibility, launch)
             prepareCart(accessibility)
-            for (coupon in codes) {
-                yieldIfExactNeeded()
-                val status = try {
-                    require(CodeValidation.isValid(coupon.code)) { "コード形式が不正です" }
-                    applyWithRetries(accessibility, coupon.code, targetAtMs)
+            val cycle = CodeRotation(codes.map { it.code })
+            rotation = cycle
+            var previousCode: String? = null
+            while (cycle.pending().isNotEmpty()) {
+                var attempting: String? = null
+                try {
+                    withinBudget(cycle) {
+                        yieldIfExactNeeded()
+                        previousCode?.let { previous ->
+                            settleConfirmation(accessibility, previous)?.let { state ->
+                                val status = AutomationFlow.completedStatus(state)
+                                if (status != null && previous in cycle.pending()) {
+                                    cycle.complete(previous, status)
+                                    onCode(previous, status, status.name)
+                                }
+                            }
+                        }
+                        val code = cycle.next(SystemClock.elapsedRealtime()) ?: throw BudgetExpired()
+                        attempting = code
+                        require(CodeValidation.isValid(code)) { "コード形式が不正です" }
+                        val status = applyOnce(accessibility, code, targetAtMs, cycle) { previousCode = code }
+                        previousCode = code
+                        cycle.complete(code, status)
+                        if (status != null) onCode(code, status, status.name)
+                    }
+                } catch (_: BudgetExpired) {
+                    break
+                } catch (_: ConfirmationAppeared) {
+                    // 初回押下前なら取り消して準備し直す。前回の券があれば次の周で承認する。
+                    if (previousCode == null) cancelInitialConfirmation(accessibility)
                 } catch (preemption: ExactPreemptionException) {
                     throw preemption
                 } catch (cancelled: CancellationException) {
                     throw cancelled
-                } catch (error: Throwable) {
-                    // 直前までの APPLIED / USED は永続済み。このコードだけを失敗にする。
-                    onCode(coupon.code, CodeStatus.FAILURE, error.message.orEmpty())
-                    onEvent("code_error", coupon.code, error.message.orEmpty())
-                    if (!recoverCheckout(accessibility)) throw error
-                    null
-                }
-                if (status != null) {
-                    onCode(coupon.code, status, status.name)
+                } catch (error: Exception) {
+                    val failed = attempting ?: previousCode?.takeIf { it in cycle.pending() }
+                    val detail = safeDetail(accessibility, error, codes)
+                    onEvent("code_error", failed.orEmpty(), detail)
                     try {
-                        closeDialog(accessibility)
-                    } catch (error: Exception) {
-                        if (!recoverCheckout(accessibility)) throw error
-                    }
+                        val recovered = withinBudget(cycle) {
+                            recoverCheckout(accessibility, previousCode) { state ->
+                                val previous = checkNotNull(previousCode)
+                                val status = AutomationFlow.completedStatus(state)
+                                if (status != null && cycle.finishIfPending(previous, status)) onCode(previous, status, status.name)
+                            }
+                        }
+                        // 回復中に適用済みと分かった券を失敗へ戻さない。
+                        if (failed != null && cycle.finishIfPending(failed, CodeStatus.FAILURE)) onCode(failed, CodeStatus.FAILURE, detail)
+                        if (!recovered) throw AutomationException(detail)
+                    } catch (_: BudgetExpired) { break }
                 }
             }
+            cycle.pending().forEach { code ->
+                onCode(code, CodeStatus.FAILURE, "全コード共通の制限時間に達しました")
+                cycle.complete(code, CodeStatus.FAILURE)
+            }
+        } catch (preemption: ExactPreemptionException) {
+            throw preemption
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            throw AutomationException(safeDetail(accessibility, error, codes))
         } finally {
             cleaningUp = true
             // キャンセル・タイムアウトでも、ダイアログを閉じてから会計を中止する。
@@ -92,7 +139,7 @@ class CouponAutomation(
                 try {
                     runCatching {
                         withTimeout(30_000) { cleanup(accessibility) }
-                    }.onFailure { runCatching { onEvent("cleanup_failure", "", it.message.orEmpty()) } }
+                    }.onFailure { runCatching { onEvent("cleanup_failure", "", safeDetail(accessibility, it, codes)) } }
                 } finally {
                     WakeActivity.dismiss()
                 }
@@ -133,64 +180,100 @@ class CouponAutomation(
         // WakeActivity はカートを実際に確認した後まで終了しない。最後の cleanup まで画面維持も継続する。
     }
 
-    private suspend fun applyWithRetries(
+    private suspend fun <T> withinBudget(cycle: CodeRotation, action: suspend () -> T): T {
+        val remaining = cycle.remainingMs(SystemClock.elapsedRealtime()) ?: return action()
+        if (remaining <= 0) throw BudgetExpired()
+        val completed = withTimeoutOrNull(remaining) { Result.success(action()) } ?: throw BudgetExpired()
+        return completed.getOrThrow()
+    }
+
+    private fun observation(service: CouponAccessibilityService, code: String): CouponObservation {
+        yieldIfExactNeeded()
+        return CouponObservation.from(service.root(CHECKOUT_ACTIVITY).flatten().map { it.shallowSnapshot() }, code)
+    }
+
+    private suspend fun approve(service: CouponAccessibilityService) {
+        currentCoroutineContext().ensureActive()
+        yieldIfExactNeeded()
+        val approve = service.root(CHECKOUT_ACTIVITY).byText("承認")
+            ?: throw AutomationException("承認ボタンが見つかりません")
+        approve.safeClick { service.root(CHECKOUT_ACTIVITY) }
+    }
+
+    private suspend fun settleConfirmation(service: CouponAccessibilityService, code: String): CouponUiState? =
+        AutomationFlow.settleBeforeNext(read = { observation(service, code) },
+            nowMs = { SystemClock.elapsedRealtime() }, approve = { approve(service) }, pause = { delay(100) })
+
+    private suspend fun applyOnce(
         service: CouponAccessibilityService,
         code: String,
         targetAtMs: Long,
-    ): CodeStatus {
-        var started = 0L
+        cycle: CodeRotation,
+        onPressed: () -> Unit,
+    ): CodeStatus? {
+        var before: CouponObservation? = null
+        var gate: CouponResultGate? = null
         AutomationFlow.applyAtTarget(targetAtMs, prepare = {
             openPromoAndSet(service, code)
             prepareApplyTarget(service, code)
-        }, await = { waitUntil(it) }, apply = {
-            started = SystemClock.elapsedRealtime()
-            clickApply(it, code, "apply")
+        }, await = { waitUntil(it) }, snapshotLeadMs = 250, snapshot = {
+            // IPC は最終待機の前。250ms の余裕で読み、指定時刻後には追加しない。
+            before = observation(service, code)
+            if (before?.state == CouponUiState.CONFIRMATION) throw ConfirmationAppeared()
+        }, apply = {
+            val validation = checkNotNull(before).validation
+            clickApply(it, code, "apply") {
+                val pressedAt = SystemClock.elapsedRealtime()
+                hasPressed = true
+                cycle.start(pressedAt)
+                gate = CouponResultGate(validation, pressedAt)
+                onPressed()
+            }
         })
-        var approved = false
-        while (SystemClock.elapsedRealtime() - started <= 15_000) {
-            yieldIfExactNeeded()
-            val nodes = service.root(CHECKOUT_ACTIVITY).flatten().filter { it.isVisibleToUser }.map { it.shallowSnapshot() }
-            when (CouponStateDecider.decide(nodes, code)) {
-                CouponUiState.CONFIRMATION -> {
-                    if (!approved) {
-                        val approve = service.root(CHECKOUT_ACTIVITY).byText("承認")
-                            ?: throw AutomationException("承認ボタンが見つかりません")
-                        approve.safeClick { service.root(CHECKOUT_ACTIVITY) }
-                        approved = true
-                    }
-                    delay(100)
+        return withinBudget(cycle) {
+            when (AutomationFlow.awaitOutcome(checkNotNull(gate), read = { observation(service, code) },
+                nowMs = { SystemClock.elapsedRealtime() }, approve = { approve(service) }, pause = { delay(100) })) {
+                CouponUiState.APPLIED -> CodeStatus.APPLIED
+                CouponUiState.USED -> CodeStatus.USED
+                else -> {
+                    // この試行だけを履歴で完了。予定の券は待機のまま巡回する。
+                    onEvent("code_failure", code, "適用できません")
+                    null
                 }
-                CouponUiState.APPLIED -> return CodeStatus.APPLIED
-                CouponUiState.USED -> return CodeStatus.USED
-                CouponUiState.INVALID -> {
-                    val elapsed = SystemClock.elapsedRealtime() - started
-                    if (elapsed > 15_000 - 500) break
-                    delay(500)
-                    // 同じダイアログ・同じ検証済みコードの適用ボタンだけを 500ms ごとに再押しする。
-                    AutomationFlow.retryInvalid(retry = {
-                        val root = service.root(CHECKOUT_ACTIVITY)
-                        val currentInput = root.byId("et_coupon_code_input_view")
-                            ?: throw AutomationException("コード入力欄が見つかりません")
-                        currentInput.setVerifiedText("") { service.root(CHECKOUT_ACTIVITY) }
-                        currentInput.setVerifiedText(code) { service.root(CHECKOUT_ACTIVITY) }
-                        waitForApplyReady(service, code)
-                        clickApply(prepareApplyTarget(service, code), code, "apply_retry")
-                    }, reread = {
-                        CouponStateDecider.decide(
-                            service.root(CHECKOUT_ACTIVITY).flatten().map { it.shallowSnapshot() }, code,
-                        )
-                    }, onRetried = { approved = false })
-                }
-                else -> delay(100)
             }
         }
-        return CodeStatus.FAILURE
+    }
+
+    private fun safeDetail(service: CouponAccessibilityService, error: Throwable, codes: List<CouponCode>): String =
+        AutomationDiagnostics.detail(error,
+            runCatching { service.root().flatten().map { it.shallowSnapshot() } }.getOrDefault(emptyList()),
+            codes.map { it.code })
+
+    private suspend fun cancelInitialConfirmation(service: CouponAccessibilityService): Boolean {
+        if (hasPressed) return false
+        val cancelled = AutomationFlow.cancelBeforeFirstPress(false, observation(service, "").state) {
+            val cancel = service.root(CHECKOUT_ACTIVITY).byText("取り消し")
+                ?: throw AutomationException("取り消しボタンが見つかりません")
+            cancel.safeClick { service.root(CHECKOUT_ACTIVITY) }
+        }
+        if (cancelled) waitFor(2_000) {
+            val root = runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull() ?: return@waitFor null
+            root.takeUnless {
+                CouponStateDecider.decide(it.flatten().map { node -> node.shallowSnapshot() }, "") == CouponUiState.CONFIRMATION
+            }
+        }
+        return cancelled
+    }
+
+    private fun rejectConfirmation(service: CouponAccessibilityService) {
+        if (observation(service, "").state == CouponUiState.CONFIRMATION) throw ConfirmationAppeared()
     }
 
     private fun prepareApplyTarget(
         service: CouponAccessibilityService,
         code: String,
     ): PreparedClick {
+        rejectConfirmation(service)
         val root = service.root(CHECKOUT_ACTIVITY)
         val input = root.byId("et_coupon_code_input_view")
             ?: throw AutomationException("コード入力欄が見つかりません")
@@ -201,9 +284,9 @@ class CouponAutomation(
         return apply.prepareSafeClick { service.root(CHECKOUT_ACTIVITY) }
     }
 
-    private fun clickApply(prepared: PreparedClick, code: String, event: String) {
+    private fun clickApply(prepared: PreparedClick, code: String, event: String, beforeDispatch: () -> Unit) {
         var beforeMs = 0L
-        val clicked = prepared.perform { beforeMs = clock.now() }
+        val clicked = prepared.perform { beforeDispatch(); beforeMs = clock.now() }
         val correctedAtMs = clock.now()
         if (!clicked) throw AutomationException("クリックに失敗しました")
         // 実際の ACTION_CLICK 直後に補正時刻を確保し、その後で永続化コールバックへ渡す。
@@ -211,11 +294,14 @@ class CouponAutomation(
     }
 
     private suspend fun openPromoAndSet(service: CouponAccessibilityService, code: String) {
-        val dialog = AutomationFlow.openDialog(open = {
-            waitForPromo(service).safeClick { service.root(CHECKOUT_ACTIVITY) }
+        rejectConfirmation(service)
+        val existing = service.root(CHECKOUT_ACTIVITY).takeIf { it.byId("et_coupon_code_input_view") != null }
+        val dialog = existing ?: AutomationFlow.openDialog(open = {
+            waitForPromo(service).safeClick { rejectConfirmation(service); service.root(CHECKOUT_ACTIVITY) }
             val opened: Any = waitFor(8_000) {
                 if (service.currentActivity == BUILDING_ACTIVITY) return@waitFor BUILDING_ACTIVITY
                 val root = runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull() ?: return@waitFor null
+                rejectConfirmation(service)
                 root.takeIf {
                     root.byId("tv_dialog_title")?.text?.toString() == "プロモコード" &&
                         root.byId("et_coupon_code_input_view") != null
@@ -228,9 +314,10 @@ class CouponAutomation(
         val input = dialog.byId("et_coupon_code_input_view")
             ?: throw AutomationException("コード入力欄が見つかりません")
         // 人が欄を触った時と同じく、先に入力欄へ合わせてから入れる（押す操作ではない）。
+        rejectConfirmation(service)
         input.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        input.setVerifiedText("") { service.root(CHECKOUT_ACTIVITY) }
-        input.setVerifiedText(code) { service.root(CHECKOUT_ACTIVITY) }
+        input.setVerifiedText("") { rejectConfirmation(service); service.root(CHECKOUT_ACTIVITY) }
+        input.setVerifiedText(code) { rejectConfirmation(service); service.root(CHECKOUT_ACTIVITY) }
         waitForApplyReady(service, code)
     }
 
@@ -246,6 +333,8 @@ class CouponAutomation(
         return try {
             waitFor(20_000) {
                 val root = runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull() ?: return@waitFor null
+                if (cancelInitialConfirmation(service)) return@waitFor null
+                rejectConfirmation(service)
                 val promo = root.byText("プロモコード")
                 // 動かした直後は画面が流れている途中なので、位置が前回と同じ（止まった）時だけ返す。
                 val bounds = promo?.let { Rect().also(it::getBoundsInScreen) }
@@ -280,22 +369,41 @@ class CouponAutomation(
 
     /** 入力欄がそのコードになり、「適用」が押せる状態になるまで待つ。 */
     private suspend fun waitForApplyReady(service: CouponAccessibilityService, code: String) {
-        var seen = ""
         try {
             waitFor(2_000) {
                 val root = runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull() ?: return@waitFor null
                 val text = root.byId("et_coupon_code_input_view")?.text?.toString()
                 val enabled = root.byId("bt_update_coupon_code_ok")?.isEnabled
-                seen = "input=$text applyEnabled=$enabled"
+                rejectConfirmation(service)
                 root.takeIf { text == code && enabled == true }
             }
         } catch (_: AutomationException) {
-            throw AutomationException("「適用」が押せる状態になりません: $seen")
+            throw AutomationException("「適用」が押せる状態になりません")
         }
     }
 
-    private suspend fun closeDialog(service: CouponAccessibilityService) {
-        val root = runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull() ?: return
+    private suspend fun closeDialog(
+        service: CouponAccessibilityService,
+        previousCode: String? = null,
+        onSettled: (CouponUiState) -> Unit = {},
+    ) {
+        var root = runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull() ?: return
+        if (CouponStateDecider.decide(root.flatten().map { it.shallowSnapshot() }, "") == CouponUiState.CONFIRMATION) {
+            AutomationFlow.resolveConfirmation(cleaningUp,
+                settle = {
+                    val code = previousCode ?: throw AutomationException("確認画面の対象コードが不明です")
+                    settleConfirmation(service, code)?.let(onSettled)
+                }, cancel = {
+                    val cancel = root.byText("取り消し") ?: throw AutomationException("取り消しボタンが見つかりません")
+                    cancel.safeClick { service.root(CHECKOUT_ACTIVITY) }
+                })
+            root = waitFor(2_000) {
+                val current = runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull() ?: return@waitFor null
+                current.takeUnless {
+                    CouponStateDecider.decide(it.flatten().map { node -> node.shallowSnapshot() }, "") == CouponUiState.CONFIRMATION
+                }
+            }
+        }
         if (!dialogVisible(root)) return
         val close = root.byId("button_close")
         if (close != null) {
@@ -310,10 +418,18 @@ class CouponAutomation(
         }
     }
 
-    private suspend fun recoverCheckout(service: CouponAccessibilityService): Boolean = try {
-        closeDialog(service)
+    private suspend fun recoverCheckout(
+        service: CouponAccessibilityService,
+        previousCode: String?,
+        onSettled: (CouponUiState) -> Unit,
+    ): Boolean = try {
+        // 例外の直後に結果だけが届いた場合も、前の券に帰属させる。
+        previousCode?.let { settleConfirmation(service, it)?.let(onSettled) }
+        closeDialog(service, previousCode, onSettled)
         val root = service.root(CHECKOUT_ACTIVITY)
         !dialogVisible(root)
+    } catch (expired: BudgetExpired) {
+        throw expired
     } catch (preemption: ExactPreemptionException) {
         throw preemption
     } catch (cancelled: CancellationException) {
@@ -332,7 +448,9 @@ class CouponAutomation(
             return
         }
         service.root(CHECKOUT_ACTIVITY)
-        closeDialog(service)
+        // 窓が閉じる途中の画面取得失敗でも、戻る・会計中止は続ける。
+        runCatching { closeDialog(service) }
+        if (runCatching { service.root(CART_ACTIVITY) }.isSuccess) return
         // 戻るの1回目はキーボードを閉じるだけのことがあるので、カートに戻るまで最大3回くり返す。
         repeat(3) {
             service.backFromAli()
@@ -360,11 +478,12 @@ class CouponAutomation(
     private fun dialogVisible(root: AccessibilityNodeInfo): Boolean =
         root.byId("et_coupon_code_input_view") != null ||
             root.byId("tv_dialog_title")?.text?.toString() == "プロモコード" ||
-            root.byId("tv_title")?.text?.toString()?.contains("本当に適用") == true
+            CouponStateDecider.decide(root.flatten().map { it.shallowSnapshot() }, "") == CouponUiState.CONFIRMATION
 
     private suspend fun waitUntil(targetAtMs: Long) {
         while (true) {
             currentCoroutineContext().ensureActive()
+            yieldIfExactNeeded()
             val delayMs = AutomationTiming.coarseDelayMs(targetAtMs - clock.now())
             if (delayMs == 0L) break
             delay(delayMs)
@@ -373,7 +492,7 @@ class CouponAutomation(
         val targetNanos = AutomationTiming.monotonicTargetNanos(targetAtMs, clock.now(), nowNanos)
         var checks = 0
         while (SystemClock.elapsedRealtimeNanos() < targetNanos) {
-            if (++checks % 256 == 0) currentCoroutineContext().ensureActive()
+            if (++checks % 256 == 0) { currentCoroutineContext().ensureActive(); yieldIfExactNeeded() }
         }
     }
 
@@ -382,7 +501,7 @@ class CouponAutomation(
         return match.groupValues[1].toIntOrNull() ?: -1
     }
 
-    private suspend fun <T : Any> waitFor(timeoutMs: Long, read: () -> T?): T {
+    private suspend fun <T : Any> waitFor(timeoutMs: Long, read: suspend () -> T?): T {
         val started = SystemClock.elapsedRealtime()
         while (true) {
             currentCoroutineContext().ensureActive()

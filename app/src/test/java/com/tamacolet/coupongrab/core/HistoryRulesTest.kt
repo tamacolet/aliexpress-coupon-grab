@@ -36,6 +36,23 @@ class HistoryRulesTest {
         assertEquals(2_100L, state.history.last().atMs)
     }
 
+    @Test fun `rotated invalid attempts finish history without finalizing coupon and preserve all press times`() {
+        var state = AppState(schedules = listOf(Schedule(id = "S", nextRunAtMs = 1000, codes = listOf(CouponCode("A"), CouponCode("B")))))
+        val events = listOf(
+            entry("apply", code = "A", detail = "correctedAtMs=1000"),
+            entry("code_failure", code = "A", detail = "適用できません"),
+            entry("apply", code = "B", detail = "correctedAtMs=2000"),
+            entry("code_used", code = "B"),
+            entry("apply", code = "A", detail = "correctedAtMs=3000"),
+            entry("code_applied", code = "A"),
+        )
+        events.forEach { state = HistoryRules.record(state, it) }
+        assertEquals(listOf("code_failure", "code_used", "code_applied"), state.history.map { it.event })
+        assertEquals(listOf(1000L, 2000L, 3000L), state.history.map { it.atMs })
+        assertEquals("適用できません", state.history.first().detail)
+        assertEquals(listOf(CodeStatus.WAITING, CodeStatus.WAITING), state.schedules.single().codes.map { it.status })
+    }
+
     @Test fun `別コードと別予定の未確定試行を上書きしない`() {
         var state = AppState()
         state = HistoryRules.record(state, entry(event = "apply", scheduleId = "A", code = "ONE", atMs = 1))

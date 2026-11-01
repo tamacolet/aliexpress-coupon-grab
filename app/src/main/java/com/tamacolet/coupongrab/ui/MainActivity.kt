@@ -2,7 +2,6 @@ package com.tamacolet.coupongrab.ui
 
 import android.Manifest
 import android.app.AlarmManager
-import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -13,6 +12,7 @@ import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -25,6 +25,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -53,7 +54,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
-import com.tamacolet.coupongrab.automation.CouponAccessibilityService
+import com.tamacolet.coupongrab.accessibility.AccessibilityWatch
 import com.tamacolet.coupongrab.core.AppState
 import com.tamacolet.coupongrab.core.ClockSource
 import com.tamacolet.coupongrab.core.CodeStatus
@@ -95,6 +96,7 @@ class MainActivity : ComponentActivity() {
                         val state = app.store.load()
                         uiState.value = state
                         now = correctedNow(state)
+                        permissionRevision.intValue++
                         delay(1_000)
                     }
                 }
@@ -106,6 +108,7 @@ class MainActivity : ComponentActivity() {
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                         modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
                     ) {
+                        item { AccessibilityWarning() }
                         item { ClockCard(uiState.value, now) }
                         item { PermissionCard() }
                         item {
@@ -154,6 +157,7 @@ class MainActivity : ComponentActivity() {
     private fun refresh() {
         uiState.value = app.store.load()
         permissionRevision.intValue++
+        AccessibilityWatch.observeConnection(this)
     }
 
     private fun saveSchedule(draft: ScheduleEditorDraft, existing: Boolean): String? {
@@ -201,12 +205,33 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
+    private fun AccessibilityWarning() {
+        permissionRevision.intValue
+        if (AccessibilityWatch.status(this) == AccessibilityWatch.Status.CONNECTED) return
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            border = BorderStroke(2.dp, MaterialTheme.colorScheme.error),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+        ) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("ユーザー補助が外れています。このままでは予約の時刻に券を取れません",
+                    color = MaterialTheme.colorScheme.onErrorContainer)
+                Button(onClick = { startActivity(AccessibilityWatch.settingsIntent(this@MainActivity)) }) {
+                    Text("付け直す")
+                }
+                Text("行が灰色で押せない時: アプリ情報 →右上︙→「制限付き設定を許可」",
+                    style = MaterialTheme.typography.bodySmall)
+                TextButton(onClick = { startActivity(AccessibilityWatch.appInfoIntent(this@MainActivity)) }) {
+                    Text("アプリ情報を開く")
+                }
+            }
+        }
+    }
+
+    @Composable
     private fun PermissionCard() {
         permissionRevision.intValue
-        val accessibilityName = ComponentName(this, CouponAccessibilityService::class.java)
-        val enabledServices = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES).orEmpty()
-        val accessibility = Settings.Secure.getInt(contentResolver, Settings.Secure.ACCESSIBILITY_ENABLED, 0) == 1 &&
-            enabledServices.split(':').any { ComponentName.unflattenFromString(it) == accessibilityName }
+        val accessibility = AccessibilityWatch.status(this)
         val exact = getSystemService(AlarmManager::class.java).canScheduleExactAlarms()
         val runtimeNotification = Build.VERSION.SDK_INT < 33 ||
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
@@ -214,8 +239,14 @@ class MainActivity : ComponentActivity() {
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("実行に必要な設定", style = MaterialTheme.typography.titleMedium)
-                PermissionRow("ユーザー補助", accessibility) {
-                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("ユーザー補助", Modifier.weight(1f))
+                    Text(accessibility.label, Modifier.weight(2f))
+                    if (accessibility != AccessibilityWatch.Status.CONNECTED) {
+                        OutlinedButton(onClick = { startActivity(AccessibilityWatch.settingsIntent(this@MainActivity)) }) {
+                            Text("設定")
+                        }
+                    }
                 }
                 PermissionRow("正確なアラーム", exact) {
                     startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:$packageName")))
@@ -310,9 +341,26 @@ private fun ScheduleEditorDialog(
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize()) {
-                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text(if (existing) "予定を編集" else "予定を追加", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
                     TextButton(onClick = onDismiss) { Text("閉じる") }
+                    if (existing) {
+                        TextButton(
+                            onClick = { onDelete(draft.id); onDismiss() },
+                            enabled = !busy,
+                        ) { Text("削除") }
+                    }
+                    Button(
+                        onClick = {
+                            attempted = true
+                            val message = onSave(draft)
+                            if (message == null) onDismiss() else error = message
+                        },
+                        enabled = !busy,
+                    ) { Text("保存") }
+                }
+                error?.let { message ->
+                    Text(message, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(horizontal = 16.dp))
                 }
                 LazyColumn(
                     contentPadding = PaddingValues(horizontal = 16.dp),
@@ -382,26 +430,6 @@ private fun ScheduleEditorDialog(
                             Switch(checked = draft.enabled, onCheckedChange = { draft = draft.copy(enabled = it) }, enabled = !busy)
                         }
                     }
-                    error?.let { message -> item { Text(message, color = MaterialTheme.colorScheme.error) } }
-                }
-                HorizontalDivider()
-                Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (existing) {
-                        OutlinedButton(
-                            onClick = { onDelete(draft.id); onDismiss() },
-                            enabled = !busy,
-                            modifier = Modifier.weight(1f),
-                        ) { Text("削除") }
-                    }
-                    Button(
-                        onClick = {
-                            attempted = true
-                            val message = onSave(draft)
-                            if (message == null) onDismiss() else error = message
-                        },
-                        enabled = !busy,
-                        modifier = Modifier.weight(1f),
-                    ) { Text("保存") }
                 }
             }
         }

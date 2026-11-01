@@ -2,11 +2,13 @@ package com.tamacolet.coupongrab.service
 
 import android.app.Notification
 import android.app.NotificationChannel
+import android.app.PendingIntent
 import android.app.NotificationManager
 import android.content.Context
 import android.content.pm.PackageManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.tamacolet.coupongrab.accessibility.AccessibilityWatch
 import com.tamacolet.coupongrab.R
 
 class Notifier(private val context: Context) {
@@ -18,6 +20,32 @@ class Notifier(private val context: Context) {
         )
         manager.createNotificationChannel(
             NotificationChannel(CHANNEL_ALERT, "時刻・実行の警告", NotificationManager.IMPORTANCE_HIGH),
+        )
+        manager.createNotificationChannel(
+            NotificationChannel(CHANNEL_ACCESSIBILITY, "ユーザー補助の準備の警告", NotificationManager.IMPORTANCE_HIGH).apply {
+                setSound(
+                    android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION),
+                    android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION).build(),
+                )
+            },
+        )
+    }
+
+    fun accessibilityDisconnected(scheduleId: String) {
+        if (!canNotify()) return
+        val settings = PendingIntent.getActivity(
+            context, 0, AccessibilityWatch.settingsIntent(context),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        manager.notify(
+            "accessibility:$scheduleId", 3,
+            NotificationCompat.Builder(context, CHANNEL_ACCESSIBILITY)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle("券取りの準備ができていません")
+                .setContentText("押してユーザー補助を付け直す")
+                .setContentIntent(settings)
+                .setAutoCancel(true)
+                .build(),
         )
     }
 
@@ -48,10 +76,7 @@ class Notifier(private val context: Context) {
     }
 
     private fun alert(title: String, text: String, notificationId: Int = 2) {
-        if (android.os.Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) !=
-            PackageManager.PERMISSION_GRANTED
-        ) return
+        if (!canNotify()) return
         manager.notify(
             notificationId,
             NotificationCompat.Builder(context, CHANNEL_ALERT)
@@ -64,9 +89,14 @@ class Notifier(private val context: Context) {
         )
     }
 
+    private fun canNotify(): Boolean = android.os.Build.VERSION.SDK_INT < 33 ||
+        ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+
     companion object {
         const val RUNNING_ID = 1
         private const val CHANNEL_RUNNING = "running"
         private const val CHANNEL_ALERT = "alerts"
+        private const val CHANNEL_ACCESSIBILITY = "accessibility_watch"
     }
 }

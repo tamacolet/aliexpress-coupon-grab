@@ -101,9 +101,10 @@ enum class CouponUiState { CONFIRMATION, USED, INVALID, DIALOG, APPLIED, UNKNOWN
 
 object CouponStateDecider {
     fun decide(nodes: List<SafetyNode>, code: String): CouponUiState {
-        val title = AliIds.byId(nodes, "tv_title")?.text.orEmpty()
         val tips = AliIds.byId(nodes, "tv_coupon_code_validation_tips")?.text.orEmpty()
-        if (title.contains("本当に適用")) return CouponUiState.CONFIRMATION
+        if (nodes.any { it.visible && (it.text.contains("本当に適用") || it.contentDescription.contains("本当に適用")) }) {
+            return CouponUiState.CONFIRMATION
+        }
         if (tips.contains("使用済み")) return CouponUiState.USED
         if (AliIds.byId(nodes, "iv_warning_icon") != null || tips.contains("適用できません")) {
             return CouponUiState.INVALID

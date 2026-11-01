@@ -7,6 +7,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
+import com.tamacolet.coupongrab.accessibility.AccessibilityWatch
 import com.tamacolet.coupongrab.automation.CouponAutomation
 import com.tamacolet.coupongrab.automation.ExactPreemptionException
 import com.tamacolet.coupongrab.core.AutomationFlow
@@ -131,6 +132,8 @@ class GrabService : Service() {
             null -> return RunDisposition.REMOVE
         }
 
+        if (schedule.kind == ScheduleKind.REPEAT) AccessibilityWatch.check(this, schedule)
+        else AccessibilityWatch.observeConnection(this)
         wakeLock.acquire(ExecutionPolicy.MAX_EXECUTION_MS)
         var failure: String? = null
         var finalize = false
@@ -179,6 +182,7 @@ class GrabService : Service() {
             failLatestPending(schedule.id, failure)
             finalize = true
         } finally {
+            AccessibilityWatch.observeConnection(this)
             if (finalize) finalizeSchedule(schedule.id, failure)
             app.store.update { it.copy(busy = false) }
             if (wakeLock.isHeld) wakeLock.release()

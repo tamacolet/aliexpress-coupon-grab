@@ -167,31 +167,14 @@ class ReviewRegressionTest {
         assertEquals(listOf("prepare", "wait:10000", "apply:ABC", "prepare", "wait:10000", "apply:ABC"), actions)
     }
 
-    @Test fun `無効再試行中は適用か承認に移った時だけ読み続ける`() = kotlinx.coroutines.runBlocking {
-        CouponUiState.entries.forEach { state ->
-            val error = AutomationException("input disappeared")
-            var read = false
-            var reset = false
-            try {
-                AutomationFlow.retryInvalid(retry = { throw error }, reread = { read = true; state },
-                    onRetried = { reset = true })
-                assertTrue(state == CouponUiState.APPLIED || state == CouponUiState.CONFIRMATION)
-            } catch (caught: AutomationException) {
-                assertTrue(caught === error)
-                assertFalse(state == CouponUiState.APPLIED || state == CouponUiState.CONFIRMATION)
-            }
-            assertTrue(read)
-            assertFalse(reset)
-        }
-    }
-
-    @Test fun `再適用で承認済みを戻し次の承認を可能にする`() = kotlinx.coroutines.runBlocking {
-        var approved = true
-        AutomationFlow.retryInvalid(retry = {}, reread = { error("unexpected reread") },
-            onRetried = { approved = false })
-        assertFalse(approved)
-        if (!approved) approved = true
-        assertTrue(approved)
+    @Test fun `snapshot precedes final target await and dispatch has no intervening read`() = kotlinx.coroutines.runBlocking {
+        val actions = mutableListOf<String>()
+        var now = 0L
+        AutomationFlow.applyAtTarget(10_000, prepare = { actions += "prepare"; "target" },
+            await = { now = it; actions += "await:$it" }, snapshotLeadMs = 250,
+            snapshot = { actions += "snapshot:$it"; now += 80 },
+            apply = { actions += "dispatch:$it:$now" })
+        assertEquals(listOf("prepare", "await:9750", "snapshot:target", "await:10000", "dispatch:target:10000"), actions)
     }
 
     @Test fun `小窓の待機切れを3回まで再試行して最終失敗だけを投げる`() = kotlinx.coroutines.runBlocking {

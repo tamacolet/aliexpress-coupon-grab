@@ -11,12 +11,27 @@ android {
         applicationId = "com.tamacolet.coupongrab"
         minSdk = 31
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
+    }
+
+    val releaseSigning = listOf(
+        "CG_KEYSTORE_FILE", "CG_KEYSTORE_PASSWORD", "CG_KEY_ALIAS", "CG_KEY_PASSWORD"
+    ).associateWith { System.getenv(it).orEmpty() }
+    if (releaseSigning.values.all { it.isNotEmpty() }) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(releaseSigning.getValue("CG_KEYSTORE_FILE"))
+                storePassword = releaseSigning.getValue("CG_KEYSTORE_PASSWORD")
+                keyAlias = releaseSigning.getValue("CG_KEY_ALIAS")
+                keyPassword = releaseSigning.getValue("CG_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
+            signingConfig = signingConfigs.findByName("release")
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }

@@ -62,23 +62,70 @@ object AutomationTiming {
 
 class AutomationException(message: String) : Exception(message)
 
-/** Android に依存しない再試行と待機。画面の読み直しも呼び出し側から渡す。 */
+/** Android に依存しない結果判定と待機。画面の読み直しも呼び出し側から渡す。 */
 object AutomationFlow {
-    suspend fun retryInvalid(retry: suspend () -> Unit, reread: () -> CouponUiState, onRetried: () -> Unit) {
-        try {
-            retry()
-            onRetried()
-        } catch (error: AutomationException) {
-            if (reread() !in listOf(CouponUiState.APPLIED, CouponUiState.CONFIRMATION)) throw error
+    suspend fun awaitOutcome(
+        gate: CouponResultGate,
+        read: () -> CouponObservation,
+        nowMs: () -> Long,
+        approve: suspend () -> Unit,
+        pause: suspend () -> Unit,
+    ): CouponUiState {
+        while (true) {
+            when (gate.observe(read(), nowMs())) {
+                CouponResultGate.Action.APPROVE -> approve()
+                CouponResultGate.Action.APPLIED -> return CouponUiState.APPLIED
+                CouponResultGate.Action.USED -> return CouponUiState.USED
+                CouponResultGate.Action.INVALID -> return CouponUiState.INVALID
+                CouponResultGate.Action.FAIL -> throw AutomationException("確認窓の承認が完了しませんでした")
+                CouponResultGate.Action.WAIT -> Unit
+            }
+            pause()
         }
     }
 
+    /** 次のコードの準備より前に、遅れて現れた確認窓を必ず処理する。 */
+    suspend fun settleBeforeNext(
+        read: () -> CouponObservation,
+        nowMs: () -> Long,
+        approve: suspend () -> Unit,
+        pause: suspend () -> Unit,
+    ): CouponUiState? {
+        val first = read()
+        if (first.state == CouponUiState.APPLIED || first.state == CouponUiState.USED) return first.state
+        if (first.state != CouponUiState.CONFIRMATION) return null
+        var initial: CouponObservation? = first
+        return awaitOutcome(CouponResultGate(first.validation, nowMs()),
+            read = { initial?.also { initial = null } ?: read() }, nowMs = nowMs, approve = approve, pause = pause)
+    }
+
+    /** 初回押下前の確認窓には帰属先がないので、安全な取り消しで閉じる。 */
+    fun cancelBeforeFirstPress(hasPressed: Boolean, state: CouponUiState, cancel: () -> Unit): Boolean {
+        if (hasPressed || state != CouponUiState.CONFIRMATION) return false
+        cancel()
+        return true
+    }
+
+    fun completedStatus(state: CouponUiState): CodeStatus? = when (state) {
+        CouponUiState.APPLIED -> CodeStatus.APPLIED
+        CouponUiState.USED -> CodeStatus.USED
+        else -> null
+    }
+
     suspend fun <T> applyAtTarget(
-        targetAtMs: Long, prepare: suspend () -> T, await: suspend (Long) -> Unit, apply: (T) -> Unit,
+        targetAtMs: Long, prepare: suspend () -> T, await: suspend (Long) -> Unit,
+        snapshotLeadMs: Long = 0, snapshot: (T) -> Unit = {}, apply: (T) -> Unit,
     ) {
         val prepared = prepare()
+        if (snapshotLeadMs > 0) await(targetAtMs - snapshotLeadMs)
+        snapshot(prepared)
         await(targetAtMs)
         apply(prepared)
+    }
+
+    /** 初回押下後の回復は承認して結果待ち。取り消しは後片付けで使う。 */
+    suspend fun resolveConfirmation(cleaningUp: Boolean, settle: suspend () -> Unit, cancel: suspend () -> Unit) {
+        if (cleaningUp) cancel() else settle()
     }
 
     suspend fun <T : Any> openDialog(open: suspend () -> T?, recover: suspend () -> Unit): T {

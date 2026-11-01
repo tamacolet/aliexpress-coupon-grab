@@ -3,6 +3,8 @@ local.properties
 **/build/
 .idea/
 *.iml
+*.jks
+*.keystore
 .DS_Store
 report.html
 report.body.html

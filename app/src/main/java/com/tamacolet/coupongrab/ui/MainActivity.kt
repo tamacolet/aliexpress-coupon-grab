@@ -327,16 +327,21 @@ private fun ClockCard(state: AppState, now: Long, measuring: Boolean, error: Str
                 !measured -> {
                     Text("時計のずれ 未測定", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "予定を実行する直前に毎回自動で測ります。今のずれを見たい時は「今すぐ測る」を押してください",
+                        "券を取る時は、直前に毎回ネットの時計と比べ、ずれを自動で直した時刻で「適用」を押します。今のずれを見たい時は「今すぐ測る」を押してください",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
                 else -> {
                     val at = clockMeasureFormat.format(Instant.ofEpochMilli(correction.measuredAtMs).atZone(jst))
                     val drift = String.format(Locale.JAPAN, "%+.2f", -correction.offsetMs / 1_000.0)
-                    Text("時計のずれ ${drift}秒（$at 測定）", style = MaterialTheme.typography.titleMedium)
+                    val direction = when {
+                        correction.offsetMs < 0 -> "スマホが進んでいる・"
+                        correction.offsetMs > 0 -> "スマホが遅れている・"
+                        else -> ""
+                    }
+                    Text("時計のずれ ${drift}秒（$direction$at 測定）", style = MaterialTheme.typography.titleMedium)
                     Text("測定方式: ${clockSourceLabel(correction.source)}")
-                    Text("予定を実行する直前にも毎回測り直します", style = MaterialTheme.typography.bodySmall)
+                    Text("券を取る時は直前に毎回測り直し、ずれを自動で直した時刻で「適用」を押します", style = MaterialTheme.typography.bodySmall)
                 }
             }
             error?.let { Text(it, color = MaterialTheme.colorScheme.error) }

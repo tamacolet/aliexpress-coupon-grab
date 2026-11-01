@@ -198,6 +198,7 @@ object RunAdmission {
     fun claim(state: AppState, request: RunRequest, nowMs: Long, elapsedMs: Long = 0): Pair<AppState, ScheduleRules.NasDecision?> {
         val schedule = state.schedules.firstOrNull { it.id == request.scheduleId }
             ?: return state to null
+        if (!ExecutionPolicy.accepts(schedule, request, nowMs)) return state to null
         if (state.securityHoldSinceMs != null) {
             val held = state.copy(schedules = state.schedules.map {
                 if (it.id == schedule.id && it.kind == ScheduleKind.REPEAT && it.enabled) {
@@ -206,7 +207,6 @@ object RunAdmission {
             }).append(HistoryEntry(nowMs, elapsedMs, "security_hold_skip", schedule.id, detail = SECURITY_CHECK_REASON))
             return held to ScheduleRules.NasDecision.SecurityHold
         }
-        if (!ExecutionPolicy.accepts(schedule, request, nowMs)) return state to null
         val decision = ScheduleRules.nasDecision(schedule, nowMs, state.nasBusyUntilMs,
             ScheduleRules.nextExactAtMs(state.schedules))
         val updated = when (decision) {

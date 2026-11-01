@@ -29,6 +29,14 @@ class ReviewFixesTest {
         assertEquals(1_300_000L, state.schedules.last().nextRunAtMs)
     }
 
+    @Test fun `hold logs one skip when the same repeat alarm arrives twice`() {
+        val request = RunRequest(repeat.id, repeat.kind)
+        val first = RunAdmission.claim(AppState(schedules = listOf(repeat), securityHoldSinceMs = 1), request, 100_000).first
+        val (second, decision) = RunAdmission.claim(first, request, 100_040)
+        assertNull(decision)
+        assertEquals(1, second.history.count { it.event == "security_hold_skip" })
+    }
+
     @Test fun `security detection history survives normal history filtering`() {
         val entry = HistoryEntry(123, 456, "security_hold", exact.id, detail = SECURITY_CHECK_REASON)
         assertEquals(listOf(entry), HistoryRules.record(AppState(), entry).history)

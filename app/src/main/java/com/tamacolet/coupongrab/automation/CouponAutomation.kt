@@ -1,5 +1,6 @@
 package com.tamacolet.coupongrab.automation
 
+import com.tamacolet.coupongrab.core.AutomationFlow
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -59,11 +60,11 @@ class CouponAutomation(
             }
             WakeActivity.launchCart(accessibility, launch)
             prepareCart(accessibility)
-            for ((index, coupon) in codes.withIndex()) {
+            for (coupon in codes) {
                 yieldIfExactNeeded()
                 val status = try {
                     require(CodeValidation.isValid(coupon.code)) { "コード形式が不正です" }
-                    applyWithRetries(accessibility, coupon.code, index == 0, targetAtMs)
+                    applyWithRetries(accessibility, coupon.code, targetAtMs)
                 } catch (preemption: ExactPreemptionException) {
                     throw preemption
                 } catch (cancelled: CancellationException) {
@@ -135,14 +136,16 @@ class CouponAutomation(
     private suspend fun applyWithRetries(
         service: CouponAccessibilityService,
         code: String,
-        first: Boolean,
         targetAtMs: Long,
     ): CodeStatus {
-        openPromoAndSet(service, code)
-        var preparedApply = prepareApplyTarget(service, code)
-        if (first) waitUntil(targetAtMs)
-        val started = SystemClock.elapsedRealtime()
-        clickApply(preparedApply, code, "apply")
+        var started = 0L
+        AutomationFlow.applyAtTarget(targetAtMs, prepare = {
+            openPromoAndSet(service, code)
+            prepareApplyTarget(service, code)
+        }, await = { waitUntil(it) }, apply = {
+            started = SystemClock.elapsedRealtime()
+            clickApply(it, code, "apply")
+        })
         var approved = false
         while (SystemClock.elapsedRealtime() - started <= 15_000) {
             yieldIfExactNeeded()
@@ -164,17 +167,19 @@ class CouponAutomation(
                     if (elapsed > 15_000 - 500) break
                     delay(500)
                     // 同じダイアログ・同じ検証済みコードの適用ボタンだけを 500ms ごとに再押しする。
-                    val root = service.root(CHECKOUT_ACTIVITY)
-                    // 小窓を開き直すと前のコードの「適用できません」が残っていることがある。
-                    // その間に今のコードが通ると小窓が閉じ、確認窓か割引額が出るので、読み続ける。
-                    val currentInput = root.byId("et_coupon_code_input_view") ?: continue
-                    // 無効と出た後は、同じ文字のままだと「適用」が押せない状態（enabled=false）になる。
-                    // 空にしてから入れ直すと押せる状態に戻る（Pixel 7a で確認）。
-                    currentInput.setVerifiedText("") { service.root(CHECKOUT_ACTIVITY) }
-                    currentInput.setVerifiedText(code) { service.root(CHECKOUT_ACTIVITY) }
-                    waitForApplyReady(service, code)
-                    preparedApply = prepareApplyTarget(service, code)
-                    clickApply(preparedApply, code, "apply_retry")
+                    AutomationFlow.retryInvalid(retry = {
+                        val root = service.root(CHECKOUT_ACTIVITY)
+                        val currentInput = root.byId("et_coupon_code_input_view")
+                            ?: throw AutomationException("コード入力欄が見つかりません")
+                        currentInput.setVerifiedText("") { service.root(CHECKOUT_ACTIVITY) }
+                        currentInput.setVerifiedText(code) { service.root(CHECKOUT_ACTIVITY) }
+                        waitForApplyReady(service, code)
+                        clickApply(prepareApplyTarget(service, code), code, "apply_retry")
+                    }, reread = {
+                        CouponStateDecider.decide(
+                            service.root(CHECKOUT_ACTIVITY).flatten().map { it.shallowSnapshot() }, code,
+                        )
+                    }, onRetried = { approved = false })
                 }
                 else -> delay(100)
             }
@@ -206,8 +211,7 @@ class CouponAutomation(
     }
 
     private suspend fun openPromoAndSet(service: CouponAccessibilityService, code: String) {
-        var dialog: AccessibilityNodeInfo? = null
-        for (attempt in 1..3) {
+        val dialog = AutomationFlow.openDialog(open = {
             waitForPromo(service).safeClick { service.root(CHECKOUT_ACTIVITY) }
             val opened: Any = waitFor(8_000) {
                 if (service.currentActivity == BUILDING_ACTIVITY) return@waitFor BUILDING_ACTIVITY
@@ -217,13 +221,8 @@ class CouponAutomation(
                         root.byId("et_coupon_code_input_view") != null
                 }
             }
-            if (opened is AccessibilityNodeInfo) {
-                dialog = opened
-                break
-            }
-            leaveBuildingPage(service)
-        }
-        if (dialog == null) throw AutomationException("プロモコードの小窓が開かず「工事中」画面になりました")
+            opened as? AccessibilityNodeInfo
+        }, recover = { leaveBuildingPage(service) })
         // 前回の文字が残っていると「適用」が押せないことがあるので、空にしてから入れる。
         // 消すボタン（×）は押した後で遅れて効き、入れた文字まで消すので使わない。
         val input = dialog.byId("et_coupon_code_input_view")
@@ -252,11 +251,13 @@ class CouponAutomation(
                 val bounds = promo?.let { Rect().also(it::getBoundsInScreen) }
                 val settled = bounds != null && bounds == lastBounds
                 lastBounds = bounds
-                if (settled && runCatching { promo!!.prepareSafeClick() }.isSuccess) return@waitFor promo
+                val paymentTop = root.byId("btn_container")?.let { Rect().also(it::getBoundsInScreen).top }
+                val covered = bounds != null && AutomationFlow.shouldScrollPromo(bounds.centerY(), paymentTop)
+                if (settled && !covered && runCatching { promo!!.prepareSafeClick() }.isSuccess) return@waitFor promo
                 if (++polls % 10 == 0 && moves < 4) {
-                    val moved = promo?.performAction(
-                        AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id,
-                    ) ?: root.scrollForward { service.root(CHECKOUT_ACTIVITY) }
+                    val moved = AutomationFlow.revealPromo(covered, show = {
+                        promo?.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id) ?: false
+                    }, scroll = { root.scrollForward { service.root(CHECKOUT_ACTIVITY) } })
                     if (moved) moves++
                 }
                 null
@@ -364,18 +365,9 @@ class CouponAutomation(
     private suspend fun waitUntil(targetAtMs: Long) {
         while (true) {
             currentCoroutineContext().ensureActive()
-            val remaining = targetAtMs - clock.now()
-            val delayMs = AutomationTiming.coarseDelayMs(remaining)
+            val delayMs = AutomationTiming.coarseDelayMs(targetAtMs - clock.now())
             if (delayMs == 0L) break
             delay(delayMs)
-        }
-        while (true) {
-            currentCoroutineContext().ensureActive()
-            val remaining = targetAtMs - clock.now()
-            val delayMs = AutomationTiming.fineDelayMs(remaining)
-            if (delayMs == 0L) break
-            // 最後400msはHandlerの実行待ちにせず、単調時計を短い間隔で読み直す。
-            Thread.sleep(delayMs)
         }
         val nowNanos = SystemClock.elapsedRealtimeNanos()
         val targetNanos = AutomationTiming.monotonicTargetNanos(targetAtMs, clock.now(), nowNanos)

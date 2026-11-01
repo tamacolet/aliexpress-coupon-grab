@@ -16,9 +16,15 @@ data class SafetyNode(
     val visible: Boolean = true,
     val enabled: Boolean = true,
     val children: List<SafetyNode> = emptyList(),
+    val readable: Boolean = true,
 )
 
 object AliIds {
+    fun <T : Any> flattenReadable(root: T, children: (T) -> List<T?>): List<T> =
+        listOf(root) + children(root).flatMap {
+            flattenReadable(it ?: throw AutomationException("画面に読み取れない部品があります"), children)
+        }
+
     fun qualified(shortName: String): String {
         require(shortName.matches(Regex("^[A-Za-z0-9_]+$")))
         return ALI_ID_PREFIX + shortName
@@ -45,7 +51,7 @@ object PaymentSafety {
         RegexOption.IGNORE_CASE,
     )
 
-    fun isForbidden(node: SafetyNode): Boolean = forbidden.containsMatchIn(
+    fun isForbidden(node: SafetyNode): Boolean = !node.readable || forbidden.containsMatchIn(
         "${node.resourceId}\n${node.text}\n${node.contentDescription}",
     )
 

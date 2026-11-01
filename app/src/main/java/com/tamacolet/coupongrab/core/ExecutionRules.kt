@@ -51,19 +51,82 @@ object ActivityEventReducer {
 }
 
 object AutomationTiming {
-    const val FINE_WAIT_THRESHOLD_MS = 400L
-    const val SPIN_THRESHOLD_MS = 2L
+    const val SPIN_THRESHOLD_MS = 20L
 
-    fun coarseDelayMs(remainingMs: Long): Long = when {
-        remainingMs <= FINE_WAIT_THRESHOLD_MS -> 0
-        else -> minOf(100L, remainingMs - FINE_WAIT_THRESHOLD_MS)
-    }
-
-    fun fineDelayMs(remainingMs: Long): Long = when {
-        remainingMs <= SPIN_THRESHOLD_MS -> 0
-        else -> minOf(5L, remainingMs - SPIN_THRESHOLD_MS)
-    }
+    fun coarseDelayMs(remainingMs: Long): Long =
+        (remainingMs - SPIN_THRESHOLD_MS).coerceIn(0L, 100L)
 
     fun monotonicTargetNanos(targetEpochMs: Long, correctedNowMs: Long, currentElapsedNanos: Long): Long =
         currentElapsedNanos + (targetEpochMs - correctedNowMs) * 1_000_000L
+}
+
+class AutomationException(message: String) : Exception(message)
+
+/** Android に依存しない再試行と待機。画面の読み直しも呼び出し側から渡す。 */
+object AutomationFlow {
+    suspend fun retryInvalid(retry: suspend () -> Unit, reread: () -> CouponUiState, onRetried: () -> Unit) {
+        try {
+            retry()
+            onRetried()
+        } catch (error: AutomationException) {
+            if (reread() !in listOf(CouponUiState.APPLIED, CouponUiState.CONFIRMATION)) throw error
+        }
+    }
+
+    suspend fun <T> applyAtTarget(
+        targetAtMs: Long, prepare: suspend () -> T, await: suspend (Long) -> Unit, apply: (T) -> Unit,
+    ) {
+        val prepared = prepare()
+        await(targetAtMs)
+        apply(prepared)
+    }
+
+    suspend fun <T : Any> openDialog(open: suspend () -> T?, recover: suspend () -> Unit): T {
+        repeat(3) { attempt ->
+            val dialog = try {
+                open()
+            } catch (error: AutomationException) {
+                if (attempt == 2) throw error
+                null
+            }
+            if (dialog != null) return dialog
+            recover()
+        }
+        throw AutomationException("プロモコードの小窓が開きませんでした")
+    }
+
+    suspend fun awaitWake(timeoutMs: Long, ready: suspend () -> Unit) {
+        if (kotlinx.coroutines.withTimeoutOrNull(timeoutMs) { ready(); true } != true) {
+            throw AutomationException("画面を起こせませんでした")
+        }
+    }
+
+    fun shouldScrollPromo(centerY: Int, paymentTop: Int?): Boolean =
+        paymentTop != null && centerY >= paymentTop
+
+    fun revealPromo(covered: Boolean, show: () -> Boolean, scroll: () -> Boolean): Boolean {
+        val shown = show()
+        val scrolled = if (covered || !shown) scroll() else false
+        return shown || scrolled
+    }
+
+    fun statusChanged(previous: CodeStatus, next: CodeStatus): Boolean = previous != next
+}
+
+/** NAS の確認と端末の占有を、同じ保存処理の最新状態から決める。 */
+object RunAdmission {
+    fun claim(state: AppState, request: RunRequest, nowMs: Long): Pair<AppState, ScheduleRules.NasDecision?> {
+        val schedule = state.schedules.firstOrNull { it.id == request.scheduleId }
+            ?: return state to null
+        if (!ExecutionPolicy.accepts(schedule, request, nowMs)) return state to null
+        val decision = ScheduleRules.nasDecision(schedule, nowMs, state.nasBusyUntilMs,
+            ScheduleRules.nextExactAtMs(state.schedules))
+        val updated = when (decision) {
+            ScheduleRules.NasDecision.Execute -> state.copy(busy = true)
+            is ScheduleRules.NasDecision.Defer -> state.copy(schedules = state.schedules.map {
+                if (it.id == schedule.id) it.copy(nextRunAtMs = nowMs + decision.delayMs) else it
+            })
+        }
+        return updated to decision
+    }
 }

@@ -122,3 +122,50 @@ class CurrentNodeSafetyTest {
         }
     }
 }
+
+class UnreadableNodeTest {
+    @Test fun `読めない子はクリックも位置タップも拒否する`() {
+        val unreadable = SafetyNode(readable = false)
+        val promo = SafetyNode(text = "プロモコード")
+        val target = SafetyNode(clickable = true, children = listOf(promo, unreadable))
+        assertTrue(PaymentSafety.isForbidden(unreadable))
+        assertFalse(PaymentSafety.canClick(promo, target, emptyList()))
+        assertFalse(PaymentSafety.canTap(promo, emptyList(), listOf(unreadable)))
+        assertFalse(PaymentSafety.canTap(promo, emptyList(), listOf(target)))
+    }
+
+    @Test fun `平坦化で座標に関係なくnullの子を捨てず拒否する`() {
+        data class Node(val children: List<Node?> = emptyList())
+        val root = Node(listOf(Node(), Node(listOf(null))))
+        org.junit.Assert.assertThrows(AutomationException::class.java) {
+            AliIds.flattenReadable(root) { it.children }
+        }
+        val safe = Node(listOf(Node(), Node()))
+        assertEquals(3, AliIds.flattenReadable(safe) { it.children }.size)
+    }
+
+    @Test fun `実際に押す一覧は安全検査を通せて支払いは拒否する`() {
+        listOf("ck_footer_select_all", "bt_checkout", "bt_update_coupon_code_ok", "button_close").forEach {
+            val node = SafetyNode(resourceId = AliIds.qualified(it), clickable = true)
+            assertTrue(PaymentSafety.canClick(node, node, emptyList()))
+        }
+        listOf("購入手続きへ", "プロモコード", "適用", "承認", "中止する").forEach {
+            val node = SafetyNode(text = it, clickable = true)
+            assertTrue(PaymentSafety.canClick(node, node, emptyList()))
+        }
+        val pay = SafetyNode(text = "今支払います", clickable = true)
+        assertFalse(PaymentSafety.canClick(pay, pay, emptyList()))
+    }
+
+    @Test fun `補助情報を含める設定と操作一覧の説明を保持する`() {
+        val project = generateSequence(java.io.File(System.getProperty("user.dir"))) { it.parentFile }
+            .first { java.io.File(it, "src/main/res/xml/accessibility_service_config.xml").exists() }
+        val xml = java.io.File(project, "src/main/res/xml/accessibility_service_config.xml").readText()
+        assertTrue(xml.contains("flagIncludeNotImportantViews"))
+        val readme = java.io.File(project.parentFile, "README.md").readText()
+        assertFalse(readme.contains("会計後の戻る操作と「中止する」だけを行い"))
+        listOf("全選択", "購入手続きへ", "プロモコード", "適用", "承認", "閉じる", "中止する", "PaymentSafety").forEach {
+            assertTrue(it, readme.contains(it))
+        }
+    }
+}

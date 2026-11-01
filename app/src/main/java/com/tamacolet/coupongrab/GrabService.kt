@@ -9,6 +9,8 @@ import android.os.SystemClock
 import android.util.Log
 import com.tamacolet.coupongrab.automation.CouponAutomation
 import com.tamacolet.coupongrab.automation.ExactPreemptionException
+import com.tamacolet.coupongrab.core.AutomationFlow
+import com.tamacolet.coupongrab.core.RunAdmission
 import com.tamacolet.coupongrab.core.AppState
 import com.tamacolet.coupongrab.core.ClockSource
 import com.tamacolet.coupongrab.core.CodeStatus
@@ -113,27 +115,22 @@ class GrabService : Service() {
             val message = "時刻指定の実行が遅延しすぎたため中止しました"
             failLatestPending(schedule.id, message)
             finalizeSchedule(schedule.id, message)
-            notifier.failure(message)
             return RunDisposition.REMOVE
         }
-        when (val decision = ScheduleRules.nasDecision(schedule, now, initial.nasBusyUntilMs)) {
+        val decision = app.store.updateWithResult { state ->
+            RunAdmission.claim(state, request, correctedNow(state))
+        }
+        when (decision) {
             is ScheduleRules.NasDecision.Defer -> {
-                val deferred = app.store.update { state ->
-                    state.copy(schedules = state.schedules.map { current ->
-                        if (current.id != schedule.id || !current.enabled) current else current.copy(
-                            nextRunAtMs = now + decision.delayMs,
-                            deferralStartedAtMs = decision.startedAtMs,
-                        )
-                    })
-                }.schedules.firstOrNull { it.id == schedule.id }
                 record("nas_defer", schedule.id, "", "delayMs=${decision.delayMs}")
-                deferred?.let { AlarmScheduler.schedule(this, it) }
+                app.store.load().schedules.firstOrNull { it.id == schedule.id }
+                    ?.let { AlarmScheduler.schedule(this, it) }
                 return RunDisposition.REMOVE
             }
             ScheduleRules.NasDecision.Execute -> Unit
+            null -> return RunDisposition.REMOVE
         }
 
-        app.store.update { it.copy(busy = true) }
         wakeLock.acquire(ExecutionPolicy.MAX_EXECUTION_MS)
         var failure: String? = null
         var finalize = false
@@ -170,11 +167,10 @@ class GrabService : Service() {
             // 繰り返し要求はキューに残し、次の選択で時刻指定を必ず先に実行する。
             preempted = true
             record("repeat_preempted", schedule.id, "", "exact queued")
-        } catch (timeout: TimeoutCancellationException) {
+        } catch (_: TimeoutCancellationException) {
             failure = "実行時間の上限を超えました"
             failLatestPending(schedule.id, failure)
             finalize = true
-            notifier.failure(timeout.message ?: failure)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Throwable) {
@@ -182,7 +178,6 @@ class GrabService : Service() {
             // 初期スナップショットではなく最新の pending だけを失敗にし、成功を後退させない。
             failLatestPending(schedule.id, failure)
             finalize = true
-            notifier.failure(failure)
         } finally {
             if (finalize) finalizeSchedule(schedule.id, failure)
             app.store.update { it.copy(busy = false) }
@@ -192,9 +187,14 @@ class GrabService : Service() {
     }
 
     private fun failLatestPending(scheduleId: String, detail: String) {
-        val pending = app.store.load().schedules.firstOrNull { it.id == scheduleId }
-            ?.let(ScheduleRules::pendingCodes).orEmpty()
-        app.store.update { state -> RunFailureReducer.apply(state, scheduleId, detail) }
+        val pending = app.store.updateWithResult { state ->
+            val updated = RunFailureReducer.apply(state, scheduleId, detail)
+            val previous = state.schedules.firstOrNull { it.id == scheduleId }?.codes.orEmpty()
+            val changed = updated.schedules.firstOrNull { it.id == scheduleId }?.codes.orEmpty().filter { code ->
+                previous.any { it.code == code.code && AutomationFlow.statusChanged(it.status, code.status) }
+            }
+            updated to changed
+        }
         pending.forEach {
             record("code_failure", scheduleId, it.code, detail)
             notifier.codeResult(it.code, CodeStatus.FAILURE, detail)
@@ -218,15 +218,17 @@ class GrabService : Service() {
     }
 
     private fun updateCode(scheduleId: String, code: String, status: CodeStatus, detail: String) {
-        app.store.update { state ->
-            state.copy(schedules = state.schedules.map { schedule ->
+        val changed = app.store.updateWithResult { state ->
+            val previous = state.schedules.firstOrNull { it.id == scheduleId }?.codes?.firstOrNull { it.code == code }
+            val updated = state.copy(schedules = state.schedules.map { schedule ->
                 if (schedule.id != scheduleId) schedule else schedule.copy(codes = schedule.codes.map {
                     if (it.code == code) it.copy(status = status, detail = detail) else it
                 })
             })
+            updated to (previous != null && AutomationFlow.statusChanged(previous.status, status))
         }
         record("code_${status.name.lowercase()}", scheduleId, code, detail)
-        notifier.codeResult(code, status, detail)
+        if (changed) notifier.codeResult(code, status, detail)
     }
 
     private fun record(event: String, scheduleId: String, code: String, detail: String) {

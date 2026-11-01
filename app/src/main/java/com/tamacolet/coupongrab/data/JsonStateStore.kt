@@ -47,13 +47,18 @@ class JsonStateStore(private val file: File) {
         }
     }
 
-    fun update(transform: (AppState) -> AppState): AppState = synchronized(lock) {
+    fun update(transform: (AppState) -> AppState): AppState = updateWithResult { state ->
+        val updated = transform(state)
+        updated to updated
+    }
+
+    fun <T> updateWithResult(transform: (AppState) -> Pair<AppState, T>): T = synchronized(lock) {
         val current = if (file.exists()) {
             runCatching { fromJson(JSONObject(file.readText(Charsets.UTF_8))) }.getOrDefault(AppState())
         } else AppState()
-        val updated = transform(current)
+        val (updated, result) = transform(current)
         save(updated)
-        updated
+        result
     }
 
     companion object {
@@ -81,7 +86,6 @@ private fun toJson(state: AppState): JSONObject = JSONObject().apply {
                 put("exactAtMs", schedule.exactAtMs ?: JSONObject.NULL)
                 put("repeatMinutes", schedule.repeatMinutes)
                 put("nextRunAtMs", schedule.nextRunAtMs)
-                put("deferralStartedAtMs", schedule.deferralStartedAtMs ?: JSONObject.NULL)
                 put("codes", JSONArray().apply {
                     schedule.codes.forEach { code ->
                         put(JSONObject().apply {
@@ -137,7 +141,6 @@ private fun fromJson(root: JSONObject): AppState {
             exactAtMs = if (item.isNull("exactAtMs")) null else item.getLong("exactAtMs"),
             repeatMinutes = item.getInt("repeatMinutes"),
             nextRunAtMs = item.getLong("nextRunAtMs"),
-            deferralStartedAtMs = if (item.isNull("deferralStartedAtMs")) null else item.getLong("deferralStartedAtMs"),
             codes = List(codesJson.length()) { codeIndex ->
                 val code = codesJson.getJSONObject(codeIndex)
                 CouponCode(

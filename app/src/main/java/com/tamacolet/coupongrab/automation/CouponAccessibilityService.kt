@@ -109,7 +109,7 @@ class CouponAccessibilityService : AccessibilityService() {
     }
 }
 
-class AutomationException(message: String) : Exception(message)
+typealias AutomationException = com.tamacolet.coupongrab.core.AutomationException
 
 fun AccessibilityNodeInfo.snapshot(): SafetyNode = SafetyNode(
     resourceId = viewIdResourceName.orEmpty(),
@@ -118,11 +118,11 @@ fun AccessibilityNodeInfo.snapshot(): SafetyNode = SafetyNode(
     clickable = isClickable,
     visible = isVisibleToUser,
     enabled = isEnabled,
-    children = List(childCount) { index -> getChild(index)?.snapshot() ?: SafetyNode() },
+    children = List(childCount) { index -> getChild(index)?.snapshot() ?: SafetyNode(readable = false) },
 )
 
 fun AccessibilityNodeInfo.flatten(): List<AccessibilityNodeInfo> =
-    listOf(this) + List(childCount) { index -> getChild(index) }.filterNotNull().flatMap { it.flatten() }
+    AliIds.flattenReadable(this) { node -> List(node.childCount) { node.getChild(it) } }
 
 fun AccessibilityNodeInfo.byId(shortName: String): AccessibilityNodeInfo? =
     findAccessibilityNodeInfosByViewId(AliIds.qualified(shortName)).firstOrNull { it.isVisibleToUser }

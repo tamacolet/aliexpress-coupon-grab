@@ -75,21 +75,23 @@ class ScheduleRulesTest {
         assertEquals(0, result.nextRunAtMs)
     }
 
-    @Test fun `NAS混雑時は30秒延期し開始時刻を保持する`() {
-        val schedule = schedule(ScheduleKind.REPEAT, listOf(waiting))
-        val first = ScheduleRules.nasDecision(schedule, 100_000, 999_000) as ScheduleRules.NasDecision.Defer
-        assertEquals(30_000, first.delayMs)
-        assertEquals(100_000, first.startedAtMs)
-        val persisted = schedule.copy(deferralStartedAtMs = first.startedAtMs)
-        val second = ScheduleRules.nasDecision(persisted, 130_000, 999_000) as ScheduleRules.NasDecision.Defer
-        assertEquals(100_000, second.startedAtMs)
+    @Test fun `NAS混雑中は10分や1日を超えても30秒延期する`() {
+        val repeat = schedule(ScheduleKind.REPEAT, listOf(waiting))
+        listOf(0L, 600_000L, 86_400_000L, 172_800_000L).forEach { now ->
+            assertEquals(ScheduleRules.NasDecision.Defer(30_000), ScheduleRules.nasDecision(repeat, now, now + 1))
+        }
+        assertEquals(ScheduleRules.NasDecision.Execute, ScheduleRules.nasDecision(repeat, 100, 100))
+        assertEquals(ScheduleRules.NasDecision.Execute,
+            ScheduleRules.nasDecision(repeat.copy(kind = ScheduleKind.EXACT), 100, Long.MAX_VALUE, 101))
     }
 
-    @Test fun `NAS混雑でも10分後と時刻指定は実行する`() {
-        val repeat = schedule(ScheduleKind.REPEAT, listOf(waiting)).copy(deferralStartedAtMs = 0)
-        assertEquals(ScheduleRules.NasDecision.Execute, ScheduleRules.nasDecision(repeat, 600_000, 999_000))
-        val exact = schedule(ScheduleKind.EXACT, listOf(waiting))
-        assertEquals(ScheduleRules.NasDecision.Execute, ScheduleRules.nasDecision(exact, 100_000, 999_000))
+    @Test fun `時刻指定の3分境界と60秒前準備を優先する`() {
+        val repeat = schedule(ScheduleKind.REPEAT, listOf(waiting))
+        listOf(180_000L, 60_000L, 0L, -1L).forEach { gap ->
+            assertEquals(ScheduleRules.NasDecision.Defer(), ScheduleRules.nasDecision(repeat, 200_000, 0, 200_000 + gap))
+        }
+        assertEquals(ScheduleRules.NasDecision.Execute, ScheduleRules.nasDecision(repeat, 200_000, 0, 380_001))
+        assertEquals(ScheduleRules.NasDecision.Execute, ScheduleRules.nasDecision(repeat, 200_000, 0, 0))
     }
 
     @Test fun `次の時刻指定だけをNASへ報告する`() {

@@ -9,7 +9,7 @@ import android.os.PowerManager
 import android.view.WindowManager
 import com.tamacolet.coupongrab.core.ExecutionPolicy
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.withTimeout
+import com.tamacolet.coupongrab.core.AutomationFlow
 import java.lang.ref.WeakReference
 
 class WakeActivity : Activity() {
@@ -83,7 +83,7 @@ class WakeActivity : Activity() {
         }
 
         suspend fun awaitReady(timeoutMs: Long = 10_000) {
-            withTimeout(timeoutMs) { ready.await() }
+            AutomationFlow.awaitWake(timeoutMs) { ready.await() }
         }
 
         /** onResume とキーガード解除を待った後、WakeActivity またはユーザー補助から開く。 */

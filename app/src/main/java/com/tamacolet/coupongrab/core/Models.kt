@@ -5,7 +5,6 @@ import java.util.UUID
 const val HISTORY_LIMIT = 100
 const val ALARM_LEAD_MS = 60_000L
 const val NAS_RETRY_MS = 30_000L
-const val NAS_MAX_DEFER_MS = 10 * 60_000L
 
 enum class ScheduleKind { EXACT, REPEAT }
 enum class CodeStatus { WAITING, APPLIED, USED, FAILURE }
@@ -25,7 +24,6 @@ data class Schedule(
     val repeatMinutes: Int = 5,
     val nextRunAtMs: Long,
     val codes: List<CouponCode>,
-    val deferralStartedAtMs: Long? = null,
 )
 
 data class TimeCorrection(
@@ -110,29 +108,25 @@ object ScheduleRules {
 
     fun afterRun(schedule: Schedule, nowMs: Long): Schedule {
         if (isComplete(schedule)) {
-            return schedule.copy(enabled = false, nextRunAtMs = 0, deferralStartedAtMs = null)
+            return schedule.copy(enabled = false, nextRunAtMs = 0)
         }
         return when (schedule.kind) {
-            ScheduleKind.EXACT -> schedule.copy(enabled = false, nextRunAtMs = 0, deferralStartedAtMs = null)
+            ScheduleKind.EXACT -> schedule.copy(enabled = false, nextRunAtMs = 0)
             ScheduleKind.REPEAT -> schedule.copy(
                 nextRunAtMs = nowMs + schedule.repeatMinutes * 60_000L,
-                deferralStartedAtMs = null,
             )
         }
     }
 
     sealed interface NasDecision {
         data object Execute : NasDecision
-        data class Defer(val delayMs: Long, val startedAtMs: Long) : NasDecision
+        data class Defer(val delayMs: Long = NAS_RETRY_MS) : NasDecision
     }
 
-    fun nasDecision(schedule: Schedule, nowMs: Long, nasBusyUntilMs: Long): NasDecision {
-        if (schedule.kind == ScheduleKind.EXACT || nasBusyUntilMs <= nowMs) return NasDecision.Execute
-        val started = schedule.deferralStartedAtMs ?: nowMs
-        val elapsed = nowMs - started
-        if (elapsed >= NAS_MAX_DEFER_MS) return NasDecision.Execute
-        val remaining = NAS_MAX_DEFER_MS - elapsed
-        return NasDecision.Defer(minOf(NAS_RETRY_MS, remaining), started)
+    fun nasDecision(schedule: Schedule, nowMs: Long, nasBusyUntilMs: Long, nextExactAtMs: Long = 0): NasDecision {
+        if (schedule.kind == ScheduleKind.EXACT) return NasDecision.Execute
+        val exactSoon = nextExactAtMs > 0 && nextExactAtMs <= nowMs + 3 * 60_000L
+        return if (nasBusyUntilMs > nowMs || exactSoon) NasDecision.Defer() else NasDecision.Execute
     }
 
     fun nextExactAtMs(schedules: List<Schedule>): Long = schedules

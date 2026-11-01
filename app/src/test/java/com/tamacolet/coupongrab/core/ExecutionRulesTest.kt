@@ -94,13 +94,13 @@ class ActivityEventReducerTest {
 }
 
 class AutomationTimingTest {
-    @Test fun `最後400msは短い間隔で最後2msはspinへ移る`() {
+    @Test fun `最後20msまで中断可能な待機をする`() {
         assertEquals(100, AutomationTiming.coarseDelayMs(1_000))
-        assertEquals(100, AutomationTiming.coarseDelayMs(500))
-        assertEquals(0, AutomationTiming.coarseDelayMs(400))
-        assertEquals(5, AutomationTiming.fineDelayMs(100))
-        assertEquals(1, AutomationTiming.fineDelayMs(3))
-        assertEquals(0, AutomationTiming.fineDelayMs(2))
+        assertEquals(100, AutomationTiming.coarseDelayMs(400))
+        assertEquals(80, AutomationTiming.coarseDelayMs(100))
+        assertEquals(1, AutomationTiming.coarseDelayMs(21))
+        assertEquals(0, AutomationTiming.coarseDelayMs(20))
+        assertEquals(0, AutomationTiming.coarseDelayMs(-1))
     }
 
     @Test fun `補正済みepochを単調時計のtargetへ写像する`() {
@@ -123,5 +123,149 @@ class CurrentRequestTest {
         assertTrue(ExecutionPolicy.accepts(schedule, RunRequest("one", ScheduleKind.EXACT), 140_000))
         assertFalse(ExecutionPolicy.accepts(schedule.copy(kind = ScheduleKind.REPEAT), RunRequest("one", ScheduleKind.REPEAT), 140_000))
         assertTrue(ExecutionPolicy.accepts(schedule.copy(kind = ScheduleKind.REPEAT), RunRequest("one", ScheduleKind.REPEAT), 200_000))
+    }
+}
+
+class ReviewRegressionTest {
+    private val schedule = Schedule(id = "repeat", nextRunAtMs = 1_000, codes = listOf(CouponCode("ABC")))
+    private val request = RunRequest("repeat", ScheduleKind.REPEAT)
+
+    @Test fun `最新のNAS状態から占有と延期を一緒に決める`() {
+        val idle = AppState(schedules = listOf(schedule))
+        val (claimed, execute) = RunAdmission.claim(idle, request, 1_000)
+        assertTrue(claimed.busy)
+        assertEquals(ScheduleRules.NasDecision.Execute, execute)
+        val (deferred, decision) = RunAdmission.claim(idle.copy(nasBusyUntilMs = 99_000), request, 1_000)
+        assertFalse(deferred.busy)
+        assertEquals(31_000, deferred.schedules.single().nextRunAtMs)
+        assertEquals(ScheduleRules.NasDecision.Defer(), decision)
+        assertEquals(99_000, deferred.nasBusyUntilMs)
+        assertEquals(null, RunAdmission.claim(idle.copy(schedules = emptyList()), request, 1_000).second)
+        assertEquals(null, RunAdmission.claim(idle.copy(schedules = listOf(schedule.copy(enabled = false))), request, 1_000).second)
+    }
+
+    @Test fun `近い時刻指定は繰り返しを延期し60秒前に時刻指定を占有する`() {
+        val exact = schedule.copy(id = "exact", kind = ScheduleKind.EXACT, nextRunAtMs = 181_000)
+        val state = AppState(schedules = listOf(schedule, exact))
+        assertEquals(ScheduleRules.NasDecision.Defer(), RunAdmission.claim(state, request, 1_000).second)
+        val (claimed, decision) = RunAdmission.claim(state.copy(nasBusyUntilMs = Long.MAX_VALUE),
+            RunRequest("exact", ScheduleKind.EXACT), 121_000)
+        assertTrue(claimed.busy)
+        assertEquals(ScheduleRules.NasDecision.Execute, decision)
+    }
+
+    @Test fun `最初の準備が失敗しても次の全コードが指定時刻を待つ`() = kotlinx.coroutines.runBlocking {
+        val actions = mutableListOf<String>()
+        try {
+            AutomationFlow.applyAtTarget<String>(10_000, prepare = { throw AutomationException("prepare failed") },
+                await = { actions += "wait:$it" }, apply = { actions += "apply" })
+        } catch (_: AutomationException) { }
+        repeat(2) {
+            AutomationFlow.applyAtTarget(10_000, prepare = { actions += "prepare"; "ABC" },
+                await = { actions += "wait:$it" }, apply = { actions += "apply:$it" })
+        }
+        assertEquals(listOf("prepare", "wait:10000", "apply:ABC", "prepare", "wait:10000", "apply:ABC"), actions)
+    }
+
+    @Test fun `無効再試行中は適用か承認に移った時だけ読み続ける`() = kotlinx.coroutines.runBlocking {
+        CouponUiState.entries.forEach { state ->
+            val error = AutomationException("input disappeared")
+            var read = false
+            var reset = false
+            try {
+                AutomationFlow.retryInvalid(retry = { throw error }, reread = { read = true; state },
+                    onRetried = { reset = true })
+                assertTrue(state == CouponUiState.APPLIED || state == CouponUiState.CONFIRMATION)
+            } catch (caught: AutomationException) {
+                assertTrue(caught === error)
+                assertFalse(state == CouponUiState.APPLIED || state == CouponUiState.CONFIRMATION)
+            }
+            assertTrue(read)
+            assertFalse(reset)
+        }
+    }
+
+    @Test fun `再適用で承認済みを戻し次の承認を可能にする`() = kotlinx.coroutines.runBlocking {
+        var approved = true
+        AutomationFlow.retryInvalid(retry = {}, reread = { error("unexpected reread") },
+            onRetried = { approved = false })
+        assertFalse(approved)
+        if (!approved) approved = true
+        assertTrue(approved)
+    }
+
+    @Test fun `小窓の待機切れを3回まで再試行して最終失敗だけを投げる`() = kotlinx.coroutines.runBlocking {
+        var attempts = 0
+        var recovered = 0
+        val result = AutomationFlow.openDialog(open = {
+            if (++attempts < 3) throw AutomationException("timeout")
+            "dialog"
+        }, recover = { recovered++ })
+        assertEquals("dialog", result)
+        assertEquals(3, attempts)
+        assertEquals(2, recovered)
+        attempts = 0
+        recovered = 0
+        val timeout = AutomationException("last timeout")
+        try {
+            AutomationFlow.openDialog<String>(open = { attempts++; throw timeout }, recover = { recovered++ })
+            org.junit.Assert.fail("must fail after three attempts")
+        } catch (error: AutomationException) {
+            assertTrue(error === timeout)
+            assertEquals(3, attempts)
+            assertEquals(2, recovered)
+        }
+    }
+
+    @Test fun `小窓再試行で取り消しを握りつぶさない`() = kotlinx.coroutines.runBlocking {
+        try {
+            AutomationFlow.openDialog<String>(open = { throw kotlinx.coroutines.CancellationException("cancel") },
+                recover = { error("must not recover cancellation") })
+            org.junit.Assert.fail("must cancel")
+        } catch (_: kotlinx.coroutines.CancellationException) { }
+    }
+
+    @Test fun `画面起動の時間切れと全体の時間切れを区別する`() = kotlinx.coroutines.runBlocking {
+        AutomationFlow.awaitWake(1_000) {}
+        try {
+            AutomationFlow.awaitWake(5) { kotlinx.coroutines.awaitCancellation() }
+            org.junit.Assert.fail("must fail wake")
+        } catch (error: AutomationException) { assertEquals("画面を起こせませんでした", error.message) }
+        try {
+            kotlinx.coroutines.withTimeout(5) {
+                AutomationFlow.awaitWake(1_000) { kotlinx.coroutines.awaitCancellation() }
+            }
+            org.junit.Assert.fail("must retain outer timeout")
+        } catch (_: kotlinx.coroutines.TimeoutCancellationException) { }
+    }
+
+    @Test fun `支払い欄より下の行は追加スクロールを求める`() {
+        assertFalse(AutomationFlow.shouldScrollPromo(99, 100))
+        assertTrue(AutomationFlow.shouldScrollPromo(100, 100))
+        assertTrue(AutomationFlow.shouldScrollPromo(101, 100))
+        assertFalse(AutomationFlow.shouldScrollPromo(101, null))
+    }
+
+    @Test fun `表示操作が成功しても支払い欄に重なる時は続けてスクロールする`() {
+        val actions = mutableListOf<String>()
+        assertTrue(AutomationFlow.revealPromo(true,
+            show = { actions += "show"; true }, scroll = { actions += "scroll"; true }))
+        assertEquals(listOf("show", "scroll"), actions)
+        actions.clear()
+        AutomationFlow.revealPromo(false, show = { actions += "show"; true }, scroll = { actions += "scroll"; true })
+        assertEquals(listOf("show"), actions)
+        actions.clear()
+        AutomationFlow.revealPromo(false, show = { actions += "show"; false }, scroll = { actions += "scroll"; true })
+        assertEquals(listOf("show", "scroll"), actions)
+    }
+
+    @Test fun `全体例外でも個別結果でも同じ失敗を通知対象にしない`() {
+        val failed = schedule.copy(codes = listOf(CouponCode("ABC", CodeStatus.FAILURE)))
+        val state = AppState(schedules = listOf(failed))
+        val again = RunFailureReducer.apply(state, "repeat", "new detail").schedules.single().codes.single()
+        assertFalse(AutomationFlow.statusChanged(CodeStatus.FAILURE, again.status))
+        assertTrue(AutomationFlow.statusChanged(CodeStatus.WAITING, again.status))
+        CodeStatus.entries.forEach { assertFalse(AutomationFlow.statusChanged(it, it)) }
+        assertTrue(AutomationFlow.statusChanged(CodeStatus.FAILURE, CodeStatus.APPLIED))
     }
 }

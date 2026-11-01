@@ -14,6 +14,7 @@ import com.tamacolet.coupongrab.core.ActivityEventReducer
 import com.tamacolet.coupongrab.core.AliIds
 import com.tamacolet.coupongrab.core.PaymentSafety
 import com.tamacolet.coupongrab.core.SafetyNode
+import com.tamacolet.coupongrab.core.SecurityCheckException
 import com.tamacolet.coupongrab.service.WakeActivity
 import kotlinx.coroutines.delay
 
@@ -68,6 +69,7 @@ class CouponAccessibilityService : AccessibilityService() {
             android.util.Log.i("CouponGrab", "root_missing windows=$seen")
             throw AutomationException("AliExpressの画面を取得できません")
         }
+        if (SecurityCheckException.isSecurityScreen(currentActivity)) throw SecurityCheckException()
         if (node.packageName?.toString() != ALI_PACKAGE) throw AutomationException("対象外のアプリが前面です")
         if (activity != null && currentActivity != activity) {
             throw AutomationException("想定外の画面です: $currentActivity")

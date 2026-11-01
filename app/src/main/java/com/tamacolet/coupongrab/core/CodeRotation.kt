@@ -5,10 +5,15 @@ class CodeRotation(codes: List<String>) {
     private var queue = codes.toList()
     private val budgetMs = 15_000L * codes.size
     private var startedAtMs: Long? = null
+    private var lastPressAtMs: Long? = null
 
     init { require(codes.isNotEmpty() && codes.distinct().size == codes.size) }
 
     fun start(nowMs: Long) { if (startedAtMs == null) startedAtMs = nowMs }
+    fun pressed(nowMs: Long) { start(nowMs); lastPressAtMs = nowMs }
+    /** 1秒ごとに31回押すとアリエクの安全確認（スライダー）が出た（7a 11-01）。押す間を空ける。 */
+    fun waitBeforePressMs(nowMs: Long): Long =
+        lastPressAtMs?.let { (it + MIN_PRESS_GAP_MS - nowMs).coerceAtLeast(0) } ?: 0
     fun remainingMs(nowMs: Long): Long? = startedAtMs?.let { (budgetMs - (nowMs - it)).coerceAtLeast(0) }
     fun expired(nowMs: Long): Boolean = remainingMs(nowMs) == 0L
     fun next(nowMs: Long): String? = queue.firstOrNull().takeUnless { expired(nowMs) }
@@ -23,6 +28,17 @@ class CodeRotation(codes: List<String>) {
     fun complete(code: String, status: CodeStatus?) {
         if (code !in queue) return
         queue = queue.filterNot { it == code } + if (status == null) listOf(code) else emptyList()
+    }
+
+    companion object { const val MIN_PRESS_GAP_MS = 2_000L }
+}
+
+const val SECURITY_CHECK_REASON = "アリエクの安全確認（スライダー）が出たので止めました。スマホで手で解いてください"
+
+/** 安全確認の画面は com.alibaba.wireless.security の ContainerActivity（7a 11-01）。解かずに止める。 */
+class SecurityCheckException : Exception(SECURITY_CHECK_REASON) {
+    companion object {
+        fun isSecurityScreen(activity: String?): Boolean = activity?.contains(".wireless.security.") == true
     }
 }
 
@@ -88,7 +104,7 @@ object AutomationDiagnostics {
         "クリック可能な要素がありません", "確認画面の対象コードが不明です",
         "後片付け中に対象外のアプリが前面になりました", "後片付けでカートへ戻れませんでした",
         "画面を起こせませんでした", "確認窓の承認が完了しませんでした",
-        "画面操作を完了できませんでした",
+        "画面操作を完了できませんでした", SECURITY_CHECK_REASON,
     )
 
     fun detail(error: Throwable, nodes: List<SafetyNode>, codes: List<String>): String {

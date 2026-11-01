@@ -259,4 +259,24 @@ class AutomationDiagnosticsTest {
         assertTrue(AutomationDiagnostics.detail(AutomationException("コード入力欄が見つかりません"), emptyList(), listOf("ABC"))
             .startsWith("コード入力欄が見つかりません"))
     }
+
+    @Test fun `presses keep a two second gap but the first press is not delayed`() {
+        val rotation = CodeRotation(listOf("A", "B"))
+        assertEquals(0, rotation.waitBeforePressMs(1_000))
+        rotation.pressed(1_000)
+        assertEquals(1_000, rotation.remainingMs(1_000)!! - rotation.remainingMs(2_000)!!)
+        assertEquals(1_500, rotation.waitBeforePressMs(1_500))
+        assertEquals(0, rotation.waitBeforePressMs(3_000))
+        rotation.pressed(3_100)
+        assertEquals(30_000L - 2_100L, rotation.remainingMs(3_100))
+        assertEquals(2_000, rotation.waitBeforePressMs(3_100))
+    }
+
+    @Test fun `the slider security screen is recognised and its reason is kept in diagnostics`() {
+        assertTrue(SecurityCheckException.isSecurityScreen("com.alibaba.wireless.security.open.middletier.fc.ui.ContainerActivity"))
+        assertFalse(SecurityCheckException.isSecurityScreen("com.alibaba.aliexpresshd.module.placeorder.PlaceOrderActivity"))
+        assertFalse(SecurityCheckException.isSecurityScreen(null))
+        val detail = AutomationDiagnostics.detail(SecurityCheckException(), emptyList(), listOf("JPD1170"))
+        assertTrue(detail.startsWith(SECURITY_CHECK_REASON))
+    }
 }

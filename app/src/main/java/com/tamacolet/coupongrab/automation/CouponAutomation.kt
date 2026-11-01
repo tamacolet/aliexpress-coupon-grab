@@ -2,6 +2,7 @@ package com.tamacolet.coupongrab.automation
 
 import com.tamacolet.coupongrab.core.AutomationDiagnostics
 import com.tamacolet.coupongrab.core.CodeRotation
+import com.tamacolet.coupongrab.core.SecurityCheckException
 import com.tamacolet.coupongrab.core.CouponObservation
 import com.tamacolet.coupongrab.core.CouponResultGate
 import com.tamacolet.coupongrab.core.AutomationFlow
@@ -102,6 +103,8 @@ class CouponAutomation(
                     if (previousCode == null) cancelInitialConfirmation(accessibility)
                 } catch (preemption: ExactPreemptionException) {
                     throw preemption
+                } catch (check: SecurityCheckException) {
+                    throw check
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (error: Exception) {
@@ -216,7 +219,10 @@ class CouponAutomation(
         AutomationFlow.applyAtTarget(targetAtMs, prepare = {
             openPromoAndSet(service, code)
             prepareApplyTarget(service, code)
-        }, await = { waitUntil(it) }, snapshotLeadMs = 250, snapshot = {
+        }, await = {
+            waitUntil(it)
+            delay(cycle.waitBeforePressMs(SystemClock.elapsedRealtime()))
+        }, snapshotLeadMs = 250, snapshot = {
             // IPC は最終待機の前。250ms の余裕で読み、指定時刻後には追加しない。
             before = observation(service, code)
             if (before?.state == CouponUiState.CONFIRMATION) throw ConfirmationAppeared()
@@ -225,7 +231,7 @@ class CouponAutomation(
             clickApply(it, code, "apply") {
                 val pressedAt = SystemClock.elapsedRealtime()
                 hasPressed = true
-                cycle.start(pressedAt)
+                cycle.pressed(pressedAt)
                 gate = CouponResultGate(validation, pressedAt)
                 onPressed()
             }

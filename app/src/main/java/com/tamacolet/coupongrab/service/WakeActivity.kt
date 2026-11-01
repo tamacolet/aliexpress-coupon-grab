@@ -33,7 +33,18 @@ class WakeActivity : Activity() {
 
     override fun onPause() {
         resumed = false
+        window.decorView.removeCallbacks(recheckKeyguard)
         super.onPause()
+    }
+
+    // 消灯から間もない時、Android 17 はロック画面を飛ばして直接解除する。その時は
+    // requestDismissKeyguard の返事が来ないので、解除されたかを自分で確かめ続ける。
+    private val recheckKeyguard = object : Runnable {
+        override fun run() {
+            if (!resumed || ready.isCompleted) return
+            if (!getSystemService(KeyguardManager::class.java).isKeyguardLocked) completeReady()
+            else window.decorView.postDelayed(this, KEYGUARD_RECHECK_MS)
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -59,6 +70,8 @@ class WakeActivity : Activity() {
                 ready.completeExceptionally(IllegalStateException("キーガードを解除できませんでした"))
             }
         })
+        window.decorView.removeCallbacks(recheckKeyguard)
+        window.decorView.postDelayed(recheckKeyguard, KEYGUARD_RECHECK_MS)
     }
 
     private fun completeReady() {
@@ -71,6 +84,7 @@ class WakeActivity : Activity() {
     }
 
     companion object {
+        private const val KEYGUARD_RECHECK_MS = 200L
         private var active: WeakReference<WakeActivity>? = null
         private var ready: CompletableDeferred<Unit> = CompletableDeferred()
         private var screenWakeLock: PowerManager.WakeLock? = null

@@ -4,7 +4,9 @@ const val ALI_PACKAGE = "com.alibaba.aliexpresshd"
 const val ALI_ID_PREFIX = "$ALI_PACKAGE:id/"
 const val CART_ACTIVITY = "com.aliexpress.android.aeaicart.ui.CartEntryActivity"
 const val CHECKOUT_ACTIVITY = "com.aliexpress.android.placeorder.ui.PlaceOrderActivity"
-const val CART_URL = "https://ja.aliexpress.com/p/shoppingcart/index.html"
+/** 対応していないウェブ画面を開いた時の「工事中」画面。 */
+const val BUILDING_ACTIVITY = "com.aliexpress.module.navigation.AEBuildingActivity"
+const val CART_URL ="https://ja.aliexpress.com/p/shoppingcart/index.html"
 
 data class SafetyNode(
     val resourceId: String = "",
@@ -57,7 +59,35 @@ object PaymentSafety {
             (ancestors + clickTarget).none(::isForbidden)
 
     fun requireSafe(entry: SafetyNode, clickTarget: SafetyNode, ancestors: List<SafetyNode>) {
-        require(canClick(entry, clickTarget, ancestors)) { "支払い・注文操作の可能性があるためクリックを拒否しました" }
+        require(canClick(entry, clickTarget, ancestors)) {
+            "支払い・注文操作の可能性があるためクリックを拒否しました: " +
+                describe(listOf(entry) + AliIds.flatten(listOf(clickTarget)) + ancestors)
+        }
+    }
+
+    /** 拒否の理由を後で調べられるよう、最初に引っかかったノードを短く書く。 */
+    private fun describe(nodes: List<SafetyNode>): String {
+        val node = nodes.firstOrNull { isForbidden(it) || !it.visible || !it.enabled } ?: return "不明"
+        val text = "${node.text}|${node.contentDescription}".take(40)
+        return "${node.resourceId.removePrefix(ALI_ID_PREFIX)} $text visible=${node.visible} enabled=${node.enabled}"
+    }
+
+    /**
+     * 押せる印の無い行（プロモコード行など）を位置で押す時の検査。
+     * 押す文字・その祖先に加え、押す位置に重なる全ノードが安全な時だけ許可する。
+     * 押せる印のあるノードはタップを受け取り得るので配下まで、ほかは自身だけを見る
+     * （画面全体の入れ物は下部の支払いボタンも配下に持つため）。
+     */
+    fun canTap(entry: SafetyNode, ancestors: List<SafetyNode>, nodesAtPoint: List<SafetyNode>): Boolean =
+        entry.visible && entry.enabled && !isForbidden(entry) &&
+            ancestors.none(::isForbidden) &&
+            nodesAtPoint.all { if (it.clickable) subtreeIsSafe(it) else !isForbidden(it) }
+
+    fun requireSafeTap(entry: SafetyNode, ancestors: List<SafetyNode>, nodesAtPoint: List<SafetyNode>) {
+        require(canTap(entry, ancestors, nodesAtPoint)) {
+            "支払い・注文操作の可能性があるため位置タップを拒否しました: " +
+                describe(listOf(entry) + ancestors + nodesAtPoint.flatMap { if (it.clickable) AliIds.flatten(listOf(it)) else listOf(it) })
+        }
     }
 }
 

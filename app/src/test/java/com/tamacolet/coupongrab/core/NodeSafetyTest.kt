@@ -40,6 +40,37 @@ class PaymentSafetyTest {
         assertFalse(PaymentSafety.canClick(entry, parent, listOf(parent)))
     }
 
+    @Test fun `押せる印の無いプロモコード行は位置タップを許可する`() {
+        val promo = SafetyNode(text = "プロモコード")
+        val row = SafetyNode(children = listOf(promo, SafetyNode(text = "コードを入力")))
+        assertTrue(PaymentSafety.canTap(promo, listOf(row), listOf(row, promo)))
+        // 押せない画面全体の入れ物は、配下に支払いボタンがあっても自身だけを見る。
+        val page = SafetyNode(children = listOf(row, SafetyNode(text = "今支払います")))
+        assertTrue(PaymentSafety.canTap(promo, listOf(row, page), listOf(page, row, promo)))
+    }
+
+    @Test fun `位置タップの場所に支払いボタンが重なれば拒否する`() {
+        val promo = SafetyNode(text = "プロモコード")
+        val payBar = SafetyNode(resourceId = AliIds.qualified("btn_container"), clickable = true)
+        assertFalse(PaymentSafety.canTap(promo, emptyList(), listOf(promo, payBar)))
+        val payChild = SafetyNode(clickable = true, children = listOf(SafetyNode(text = "今支払います")))
+        assertFalse(PaymentSafety.canTap(promo, emptyList(), listOf(payChild)))
+    }
+
+    @Test fun `位置タップでも支払いの祖先は拒否する`() {
+        val entry = SafetyNode(text = "確定")
+        assertFalse(PaymentSafety.canTap(entry, listOf(SafetyNode(text = "注文")), listOf(entry)))
+    }
+
+    @Test fun `拒否の理由に引っかかった部品を書く`() {
+        val disabled = SafetyNode(resourceId = AliIds.qualified("bt_update_coupon_code_ok"), text = "適用",
+            clickable = true, enabled = false)
+        val error = org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            PaymentSafety.requireSafe(disabled, disabled, emptyList())
+        }
+        assertTrue(error.message!!.contains("bt_update_coupon_code_ok 適用| visible=true enabled=false"))
+    }
+
     @Test fun `対象外の支払いノードだけでは別の直接ボタンを拒否しない`() {
         val apply = SafetyNode(text = "適用", clickable = true)
         val root = SafetyNode(children = listOf(apply, SafetyNode(text = "注文")))

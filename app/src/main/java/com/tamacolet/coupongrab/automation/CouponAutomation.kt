@@ -3,11 +3,13 @@ package com.tamacolet.coupongrab.automation
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.graphics.Rect
 import android.os.SystemClock
 import android.view.accessibility.AccessibilityNodeInfo
 import com.tamacolet.coupongrab.core.ALI_PACKAGE
 import com.tamacolet.coupongrab.core.AutomationTiming
 import com.tamacolet.coupongrab.core.CART_ACTIVITY
+import com.tamacolet.coupongrab.core.BUILDING_ACTIVITY
 import com.tamacolet.coupongrab.core.CART_URL
 import com.tamacolet.coupongrab.core.CHECKOUT_ACTIVITY
 import com.tamacolet.coupongrab.core.CodeStatus
@@ -88,7 +90,7 @@ class CouponAutomation(
             withContext(NonCancellable) {
                 try {
                     runCatching {
-                        withTimeout(15_000) { cleanup(accessibility) }
+                        withTimeout(30_000) { cleanup(accessibility) }
                     }.onFailure { runCatching { onEvent("cleanup_failure", "", it.message.orEmpty()) } }
                 } finally {
                     WakeActivity.dismiss()
@@ -126,20 +128,7 @@ class CouponAutomation(
             ?: throw AutomationException("カートが空か、購入手続きへ進めません")
         checkoutAttempted = true
         checkout.safeClick { service.root(CART_ACTIVITY) }
-        var checkoutScreen = waitFor(20_000) {
-            runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull()
-        }
-        repeat(3) {
-            if (checkoutScreen.byText("プロモコード") != null) return@repeat
-            if (!checkoutScreen.scrollForward { service.root(CHECKOUT_ACTIVITY) }) return@repeat
-            delay(400)
-            checkoutScreen = waitFor(2_000) {
-                runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull()
-            }
-        }
-        if (checkoutScreen.byText("プロモコード") == null) {
-            throw AutomationException("プロモコード欄が見つかりません")
-        }
+        waitForPromo(service)
         // WakeActivity はカートを実際に確認した後まで終了しない。最後の cleanup まで画面維持も継続する。
     }
 
@@ -157,7 +146,7 @@ class CouponAutomation(
         var approved = false
         while (SystemClock.elapsedRealtime() - started <= 15_000) {
             yieldIfExactNeeded()
-            val nodes = service.root(CHECKOUT_ACTIVITY).flatten().filter { it.isVisibleToUser }.map { it.snapshot() }
+            val nodes = service.root(CHECKOUT_ACTIVITY).flatten().filter { it.isVisibleToUser }.map { it.shallowSnapshot() }
             when (CouponStateDecider.decide(nodes, code)) {
                 CouponUiState.CONFIRMATION -> {
                     if (!approved) {
@@ -176,19 +165,14 @@ class CouponAutomation(
                     delay(500)
                     // 同じダイアログ・同じ検証済みコードの適用ボタンだけを 500ms ごとに再押しする。
                     val root = service.root(CHECKOUT_ACTIVITY)
-                    val currentInput = root.byId("et_coupon_code_input_view")
-                    if (currentInput == null) {
-                        openPromoAndSet(service, code)
-                    } else if (currentInput.text?.toString() != code) {
-                        root.byId("fl_coupon_code_clear_icon")?.safeClick { service.root(CHECKOUT_ACTIVITY) }
-                        currentInput.setVerifiedText(code) { service.root(CHECKOUT_ACTIVITY) }
-                        waitFor(2_000) {
-                            runCatching {
-                                service.root(CHECKOUT_ACTIVITY).byId("et_coupon_code_input_view")
-                                    ?.takeIf { it.text?.toString() == code }
-                            }.getOrNull()
-                        }
-                    }
+                    // 小窓を開き直すと前のコードの「適用できません」が残っていることがある。
+                    // その間に今のコードが通ると小窓が閉じ、確認窓か割引額が出るので、読み続ける。
+                    val currentInput = root.byId("et_coupon_code_input_view") ?: continue
+                    // 無効と出た後は、同じ文字のままだと「適用」が押せない状態（enabled=false）になる。
+                    // 空にしてから入れ直すと押せる状態に戻る（Pixel 7a で確認）。
+                    currentInput.setVerifiedText("") { service.root(CHECKOUT_ACTIVITY) }
+                    currentInput.setVerifiedText(code) { service.root(CHECKOUT_ACTIVITY) }
+                    waitForApplyReady(service, code)
                     preparedApply = prepareApplyTarget(service, code)
                     clickApply(preparedApply, code, "apply_retry")
                 }
@@ -222,25 +206,90 @@ class CouponAutomation(
     }
 
     private suspend fun openPromoAndSet(service: CouponAccessibilityService, code: String) {
-        val promo = service.root(CHECKOUT_ACTIVITY).byText("プロモコード")
-            ?: throw AutomationException("プロモコード欄が見つかりません")
-        promo.safeClick { service.root(CHECKOUT_ACTIVITY) }
-        val dialog = waitFor(8_000) {
-            val root = runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull() ?: return@waitFor null
-            root.takeIf {
-                root.byId("tv_dialog_title")?.text?.toString() == "プロモコード" &&
-                    root.byId("et_coupon_code_input_view") != null
+        var dialog: AccessibilityNodeInfo? = null
+        for (attempt in 1..3) {
+            waitForPromo(service).safeClick { service.root(CHECKOUT_ACTIVITY) }
+            val opened: Any = waitFor(8_000) {
+                if (service.currentActivity == BUILDING_ACTIVITY) return@waitFor BUILDING_ACTIVITY
+                val root = runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull() ?: return@waitFor null
+                root.takeIf {
+                    root.byId("tv_dialog_title")?.text?.toString() == "プロモコード" &&
+                        root.byId("et_coupon_code_input_view") != null
+                }
             }
+            if (opened is AccessibilityNodeInfo) {
+                dialog = opened
+                break
+            }
+            leaveBuildingPage(service)
         }
-        dialog.byId("fl_coupon_code_clear_icon")?.safeClick { service.root(CHECKOUT_ACTIVITY) }
-        val input = service.root(CHECKOUT_ACTIVITY).byId("et_coupon_code_input_view")
+        if (dialog == null) throw AutomationException("プロモコードの小窓が開かず「工事中」画面になりました")
+        // 前回の文字が残っていると「適用」が押せないことがあるので、空にしてから入れる。
+        // 消すボタン（×）は押した後で遅れて効き、入れた文字まで消すので使わない。
+        val input = dialog.byId("et_coupon_code_input_view")
             ?: throw AutomationException("コード入力欄が見つかりません")
+        // 人が欄を触った時と同じく、先に入力欄へ合わせてから入れる（押す操作ではない）。
+        input.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        input.setVerifiedText("") { service.root(CHECKOUT_ACTIVITY) }
         input.setVerifiedText(code) { service.root(CHECKOUT_ACTIVITY) }
-        waitFor(2_000) {
-            val current = runCatching {
-                service.root(CHECKOUT_ACTIVITY).byId("et_coupon_code_input_view")
-            }.getOrNull() ?: return@waitFor null
-            current.takeIf { it.text?.toString() == code }
+        waitForApplyReady(service, code)
+    }
+
+    /**
+     * プロモコード行が安全に押せる位置に出るまで待って返す。
+     * 開いた直後は読み込み中のことがあり、支払い方法の欄が長いと行が画面の下端で支払い欄と重なる。
+     * 1秒ごとに、行が見えていれば画面の中へ出し（ACTION_SHOW_ON_SCREEN）、見えなければ下へ送る（計4回まで）。
+     */
+    private suspend fun waitForPromo(service: CouponAccessibilityService): AccessibilityNodeInfo {
+        var polls = 0
+        var moves = 0
+        var lastBounds: Rect? = null
+        return try {
+            waitFor(20_000) {
+                val root = runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull() ?: return@waitFor null
+                val promo = root.byText("プロモコード")
+                // 動かした直後は画面が流れている途中なので、位置が前回と同じ（止まった）時だけ返す。
+                val bounds = promo?.let { Rect().also(it::getBoundsInScreen) }
+                val settled = bounds != null && bounds == lastBounds
+                lastBounds = bounds
+                if (settled && runCatching { promo!!.prepareSafeClick() }.isSuccess) return@waitFor promo
+                if (++polls % 10 == 0 && moves < 4) {
+                    val moved = promo?.performAction(
+                        AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id,
+                    ) ?: root.scrollForward { service.root(CHECKOUT_ACTIVITY) }
+                    if (moved) moves++
+                }
+                null
+            }
+        } catch (_: AutomationException) {
+            throw AutomationException("プロモコード欄が見つかりません")
+        }
+    }
+
+    /**
+     * 読み込み途中にプロモコード行を押すと、小窓ではなくウェブの「工事中」画面
+     * （promocode_v3.html）が開くことがある（7aで確認）。戻って購入手続きへ帰る。
+     */
+    private suspend fun leaveBuildingPage(service: CouponAccessibilityService) {
+        if (service.currentActivity != BUILDING_ACTIVITY) return
+        onEvent("building_page", "", "")
+        service.backFromAli()
+        waitFor(5_000) { runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull() }
+    }
+
+    /** 入力欄がそのコードになり、「適用」が押せる状態になるまで待つ。 */
+    private suspend fun waitForApplyReady(service: CouponAccessibilityService, code: String) {
+        var seen = ""
+        try {
+            waitFor(2_000) {
+                val root = runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull() ?: return@waitFor null
+                val text = root.byId("et_coupon_code_input_view")?.text?.toString()
+                val enabled = root.byId("bt_update_coupon_code_ok")?.isEnabled
+                seen = "input=$text applyEnabled=$enabled"
+                root.takeIf { text == code && enabled == true }
+            }
+        } catch (_: AutomationException) {
+            throw AutomationException("「適用」が押せる状態になりません: $seen")
         }
     }
 
@@ -276,24 +325,35 @@ class CouponAutomation(
         if (!checkoutAttempted) return
         runCatching { service.root() }.getOrNull()
             ?: throw AutomationException("後片付け中に対象外のアプリが前面になりました")
+        leaveBuildingPage(service)
         if (service.currentActivity == CART_ACTIVITY) {
             service.root(CART_ACTIVITY)
             return
         }
         service.root(CHECKOUT_ACTIVITY)
         closeDialog(service)
-        service.backFromAli()
-        val cancel = try {
-            waitFor(3_000) {
-                val root = runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull() ?: return@waitFor null
-                val title = root.byId("tv_title")?.text?.toString().orEmpty()
-                if (title.contains("会計手続きを中止しますか")) root.byText("中止する") else null
+        // 戻るの1回目はキーボードを閉じるだけのことがあるので、カートに戻るまで最大3回くり返す。
+        repeat(3) {
+            service.backFromAli()
+            val cancel = try {
+                waitFor(3_000) {
+                    val root = runCatching { service.root(CHECKOUT_ACTIVITY) }.getOrNull() ?: return@waitFor null
+                    val title = root.byId("tv_title")?.text?.toString().orEmpty()
+                    if (title.contains("会計手続きを中止しますか")) root.byText("中止する") else null
+                }
+            } catch (_: AutomationException) {
+                null // キーボードが閉じただけ、または確認なしでカートへ戻る画面版。
             }
-        } catch (_: AutomationException) {
-            null // 確認なしでカートへ戻る画面版にも対応する。
+            cancel?.safeClick { service.root(CHECKOUT_ACTIVITY) }
+            val backAtCart = try {
+                waitFor(if (cancel != null) 10_000 else 1_000) { runCatching { service.root(CART_ACTIVITY) }.getOrNull() }
+                true
+            } catch (_: AutomationException) {
+                false
+            }
+            if (backAtCart) return
         }
-        cancel?.safeClick { service.root(CHECKOUT_ACTIVITY) }
-        waitFor(10_000) { runCatching { service.root(CART_ACTIVITY) }.getOrNull() }
+        throw AutomationException("後片付けでカートへ戻れませんでした")
     }
 
     private fun dialogVisible(root: AccessibilityNodeInfo): Boolean =
